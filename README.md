@@ -1,3 +1,7 @@
+![GitHub stars](https://img.shields.io/github/stars/TheCascadian/HOI4FocusGUI?style=flat-square)
+![GitHub forks](https://img.shields.io/github/forksTheCascadian/HOI4FocusGUI?style=flat-square)
+![GitHub watchers](https://img.shields.io/github/watchers/TheCascadian/HOI4FocusGUI?style=flat-square)
+
 # HOI4FocusGUI
 Python-based Hearts of Iron IV mod GUI, primarily built for generating random focus trees.
 
