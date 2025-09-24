@@ -1,4 +1,4 @@
-# HOI4 Focus GUI
+![# HOI4 Focus GUI](images/HOI4TEXT.png)
 
 ![GitHub stars](https://img.shields.io/github/stars/TheCascadian/HOI4FocusGUI?style=flat-square)
 ![GitHub forks](https://img.shields.io/github/forks/TheCascadian/HOI4FocusGUI?style=flat-square)
