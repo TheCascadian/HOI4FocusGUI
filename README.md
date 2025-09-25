@@ -1,7 +1,6 @@
 ![# HOI4 Focus GUI](images/HOI4TEXT.png)
 
 ![Downloads](https://img.shields.io/github/downloads/TheCascadian/HOI4FocusGUI/total)
-
 ![GitHub stars](https://img.shields.io/github/stars/TheCascadian/HOI4FocusGUI?style=flat-square)
 ![GitHub forks](https://img.shields.io/github/forks/TheCascadian/HOI4FocusGUI?style=flat-square)
 ![GitHub watchers](https://img.shields.io/github/watchers/TheCascadian/HOI4FocusGUI?style=flat-square)
@@ -15,7 +14,7 @@
 ---
 
 ## FEATURES*
-*<sub>*may change at ANY time</sub>
+*<sub>may change at ANY time</sub>
 
 ### Project Manager
 
