@@ -36,7 +36,7 @@
 
 ---
 
-## ⚠️ USER WARNING (Norton AV)
+## ⚠️ USER WARNING (Norton AV & Windows Defender)
 
 - This will likely be flagged as a virus -- mainly because it is an .exe file made with the use of PyInstaller via AutoPyToExe. Also, I cannot afford to certify this app. 
 - If you still want to use it: on the right side of the options for it, there's "Restore", and "Add Exclusion and Restore", click the second option. This should allow you to use the app.
