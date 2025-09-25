@@ -2,7 +2,6 @@
 
 ![Downloads](https://img.shields.io/github/downloads/TheCascadian/HOI4FocusGUI/total)
 ![GitHub stars](https://img.shields.io/github/stars/TheCascadian/HOI4FocusGUI?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/TheCascadian/HOI4FocusGUI?style=flat-square)
 ![GitHub watchers](https://img.shields.io/github/watchers/TheCascadian/HOI4FocusGUI?style=flat-square)
 
 > **DISCORD LINK** - Prophet's Preposterous Projects: https://discord.gg/RuaR7CBy7Z
