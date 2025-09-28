@@ -1,14 +1,29 @@
 name: Notify Discord
+
 on:
- push:
-   branches:
-     - main
+  release:
+    types: [published]   # fires when a new release is created
+
 jobs:
- notify-discord:
-   runs-on: ubuntu-latest
-   steps:
-     - name: Send Notification to Discord
-       uses: tsickert/discord-webhook@v7.0.0
-       with:
-         webhook-url: ${{ secrets.WEBHOOK_URL }}
-         content: "There is a new release of the HOI4 Focus GUI! Check it out!"
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch release info
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release = context.payload.release;
+            return {
+              tag_name: release.tag_name,
+              body: release.body
+            };
+
+      - name: Send Notification to Discord
+        uses: tsickert/discord-webhook@v7.0.0
+        with:
+          webhook-url: ${{ secrets.WEBHOOK_URL }}
+          content: |
+            **New Release: ${{ steps.release.outputs.tag_name }}**
+            ${{ steps.release.outputs.body }}
+            <${{ github.event.release.html_url }}>
