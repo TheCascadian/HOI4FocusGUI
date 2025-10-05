@@ -1,14 +1,139 @@
 name: Notify Discord
+
 on:
- push:
-   branches:
-     - main
+  push:
+    branches:
+      - main
+      - '**'  # Triggers on pushes to any branch
+  release:
+    types: [published, edited, created, released, prereleased]
+  workflow_dispatch:  # Allows manual triggering
+
 jobs:
- notify-discord:
-   runs-on: ubuntu-latest
-   steps:
-     - name: Send Notification to Discord
-       uses: tsickert/discord-webhook@v7.0.0
-       with:
-         webhook-url: ${{ secrets.WEBHOOK_URL }}
-         content: "There is a new release of the HOI4 Focus GUI! Check it out!\nhttps://github.com/TheCascadian/HOI4FocusGUI/releases"
+  notify-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Release Notification to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          RELEASE_TYPE="${{ github.event.release.prerelease }}"
+          if [ "$RELEASE_TYPE" = "true" ]; then
+            TYPE_LABEL="Pre-Release"
+            COLOR="16776960"  # Yellow
+          else
+            TYPE_LABEL="Release"
+            COLOR="5763719"  # Green
+          fi
+          
+          ACTION="${{ github.event.action }}"
+          if [ "$ACTION" = "edited" ]; then
+            TITLE="Release Updated: ${{ github.event.release.name }}"
+          elif [ "$ACTION" = "prereleased" ]; then
+            TITLE="New Pre-Release: ${{ github.event.release.name }}"
+          else
+            TITLE="New Release: ${{ github.event.release.name }}"
+          fi
+          
+          BODY=$(echo '${{ github.event.release.body }}' | jq -Rs . | cut -c 2- | rev | cut -c 2- | rev)
+          if [ ${#BODY} -gt 1000 ]; then
+            BODY="${BODY:0:1000}..."
+          fi
+          
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "embeds": [{
+                   "title": "'"$TITLE"'",
+                   "description": "'"$BODY"'",
+                   "color": '"$COLOR"',
+                   "fields": [
+                     {
+                       "name": "Version",
+                       "value": "'"${{ github.event.release.tag_name }}"'",
+                       "inline": true
+                     },
+                     {
+                       "name": "Type",
+                       "value": "'"$TYPE_LABEL"'",
+                       "inline": true
+                     },
+                     {
+                       "name": "Author",
+                       "value": "'"${{ github.event.release.author.login }}"'",
+                       "inline": true
+                     }
+                   ],
+                   "url": "'"${{ github.event.release.html_url }}"'",
+                   "timestamp": "'"${{ github.event.release.published_at }}"'"
+                 }]
+               }' \
+               "$WEBHOOK_URL"
+
+  notify-push:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Fetch last 2 commits to compare
+
+      - name: Send Push Notification to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=format:'%s')
+          COMMIT_BODY=$(git log -1 --pretty=format:'%b')
+          COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an')
+          COMMIT_SHA_SHORT=$(git log -1 --pretty=format:'%h')
+          BRANCH_NAME="${{ github.ref_name }}"
+          
+          # Get list of changed files
+          FILES_CHANGED=$(git diff --name-only HEAD^ HEAD | head -10)
+          FILE_COUNT=$(git diff --name-only HEAD^ HEAD | wc -l)
+          
+          if [ $FILE_COUNT -gt 10 ]; then
+            FILES_DISPLAY="$FILES_CHANGED\n... and $((FILE_COUNT - 10)) more files"
+          else
+            FILES_DISPLAY="$FILES_CHANGED"
+          fi
+          
+          # Escape special characters for JSON
+          COMMIT_MSG=$(echo "$COMMIT_MSG" | jq -Rs .)
+          COMMIT_BODY=$(echo "$COMMIT_BODY" | jq -Rs .)
+          FILES_DISPLAY=$(echo "$FILES_DISPLAY" | jq -Rs .)
+          
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "embeds": [{
+                   "title": "New Push to '"$BRANCH_NAME"'",
+                   "description": '"$COMMIT_MSG"',
+                   "color": 3447003,
+                   "fields": [
+                     {
+                       "name": "Commit",
+                       "value": "[`'"$COMMIT_SHA_SHORT"'`]('"${{ github.event.head_commit.url }}"')",
+                       "inline": true
+                     },
+                     {
+                       "name": "Author",
+                       "value": "'"$COMMIT_AUTHOR"'",
+                       "inline": true
+                     },
+                     {
+                       "name": "Branch",
+                       "value": "'"$BRANCH_NAME"'",
+                       "inline": true
+                     },
+                     {
+                       "name": "Files Changed ('"$FILE_COUNT"')",
+                       "value": "```\n'"$(echo "$FILES_DISPLAY" | cut -c 2- | rev | cut -c 2- | rev)"'\n```",
+                       "inline": false
+                     }
+                   ],
+                   "url": "'"${{ github.event.head_commit.url }}"'",
+                   "timestamp": "'"${{ github.event.head_commit.timestamp }}"'"
+                 }]
+               }' \
+               "$WEBHOOK_URL"
