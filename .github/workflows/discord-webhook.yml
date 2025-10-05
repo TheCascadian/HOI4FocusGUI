@@ -1,20 +1,14 @@
-name: Discord Release Notification
-
+name: Notify Discord
 on:
-  release:
-    types: [published, prereleased, edited, released, created]
-
-permissions:
-  contents: read
-
+ push:
+   branches:
+     - main
 jobs:
-  notify:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send Discord notification
-        run: |
-          echo "Posting release info to Discord..."
-          curl -H "Content-Type: application/json" \
-               -X POST \
-               -d "{\"content\": \"**New Release:** ${{ github.event.release.name }} (${ { github.event.release.tag_name }} )\n${{ github.event.release.html_url }}\"}" \
-               ${{ secrets.DISCORD_WEBHOOK }}
+ notify-discord:
+   runs-on: ubuntu-latest
+   steps:
+     - name: Send Notification to Discord
+       uses: tsickert/discord-webhook@v7.0.0
+       with:
+         webhook-url: ${{ secrets.WEBHOOK_URL }}
+         content: "There is a new release of the HOI4 Focus GUI! Check it out!\nhttps://github.com/TheCascadian/HOI4FocusGUI/releases"
