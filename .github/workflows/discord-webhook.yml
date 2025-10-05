@@ -1,25 +1,26 @@
 name: Notify Discord
-
 on:
   release:
-    types: [published]   # fires when a new release is created
+    types: [published, prereleased, edited]
+
+permissions:
+  contents: read
 
 jobs:
-  notify-discord:
+  notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch release info
-        id: release
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const release = context.payload.release;
-            core.setOutput("tag_name", release.tag_name);
-            core.setOutput("body", release.body);
+      - name: Send Discord notification
+        uses: Ilshidur/action-discord@master
 
-      - name: Send Notification to Discord
-        uses: tsickert/discord-webhook@v7.0.0
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         with:
-          webhook-url: ${{ secrets.WEBHOOK_URL }}
-          content: |
-            **New Release: <${{ github.event.release.html_url }}>
+          args: |
+            🚀 **New Release Published**
+            Repository: ${{ github.repository }}
+            Release: [${{ github.event.release.tag_name }}](${{ github.event.release.html_url }})
+            Author: ${{ github.actor }}
+            Name: ${{ github.event.release.name }}
+            Description:
+            ${{ github.event.release.body }}
