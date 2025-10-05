@@ -3,8 +3,8 @@
 ![Downloads](https://img.shields.io/github/downloads/TheCascadian/HOI4FocusGUI/total)
 ![GitHub stars](https://img.shields.io/github/stars/TheCascadian/HOI4FocusGUI?style=flat-square)
 ![GitHub watchers](https://img.shields.io/github/watchers/TheCascadian/HOI4FocusGUI?style=flat-square)
+[![Discord](https://img.shields.io/discord/1201161505442381884?label=Discord&logo=discord&style=flat-square)](https://discord.com/invite/RuaR7CBy7Z)
 
-> **DISCORD LINK** - Prophet's Preposterous Projects: https://discord.gg/RuaR7CBy7Z
 
 > **Original Reddit Post** - https://www.reddit.com/r/hoi4modding/comments/1nmkbg5/focus_tree_editor_tool
 
