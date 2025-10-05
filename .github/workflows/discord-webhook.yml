@@ -1,7 +1,8 @@
-name: Notify Discord
+name: Discord Release Notification
+
 on:
   release:
-    types: [published, prereleased, edited]
+    types: [published, prereleased, edited, released, created]
 
 permissions:
   contents: read
@@ -11,16 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Send Discord notification
-        uses: Ilshidur/action-discord@master
-
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        with:
-          args: |
-            🚀 **New Release Published**
-            Repository: ${{ github.repository }}
-            Release: [${{ github.event.release.tag_name }}](${{ github.event.release.html_url }})
-            Author: ${{ github.actor }}
-            Name: ${{ github.event.release.name }}
-            Description:
-            ${{ github.event.release.body }}
+        run: |
+          echo "Posting release info to Discord..."
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"**New Release:** ${{ github.event.release.name }} (${ { github.event.release.tag_name }} )\n${{ github.event.release.html_url }}\"}" \
+               ${{ secrets.DISCORD_WEBHOOK }}
