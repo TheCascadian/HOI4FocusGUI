@@ -12,26 +12,34 @@
 
 ---
 
-## FEATURES*
-*<sub>may change at ANY time</sub>
+# FEATURES in 1.0.9
 
-### Project Manager
+## Main Canvas (Node Editor Window)
+![Main Canvas](images/MainCanvas.PNG)
 
-![Project Manager](images/project_manager.PNG)
+## New Project (Project Manager Window)
+![Project Manager Panel](images/NewProject.png)
 
-![App Folders](images/app_folders.png)
+## Generate Focus Tree (Tool)
+![Generate Tree Tool](images/GenerateTreeTool.png)
 
-### Confirmation Popups
+### Focus Editor Panel (Window)
+![Focus Editor](images/FocusEditor.png)
 
-![Loaded Project Dialog](images/loaded_project_dialog.PNG)
+### Focus Frames, Notes and Mutex Icons (Optional, Tool, Appearance)
+![Focus Frames](images/FocusFrames.PNG)
 
-### Editor Canvas
+## Multi Rendering Modes (Customizable)
+![Icons, Default](images/Icon_V_Default.png)
 
-![Project Canvas](images/project_canvas.PNG)
+# Canvas Appearance and Performance (Settings)
+![Appearance & Performance](images/Appearance_Performance.png)
 
-### Toolbar
+## Conflicting Keybinds Detection & Display (Configurable)
+![Conflicting Keybinds](images/ConflictingKeybinds.png)
 
-![Main Toolbar](images/main_toolbar.png)
+# Export Mod to HOI4 (Tool)
+![Export to HOI4](images/Export.png)
 
 ---
 
@@ -44,7 +52,7 @@
 
 ## ⚠️ **PLEASE READ!**
 
-1. **Save frequently.** There is no auto-save feature (so far). Backup your files in another folder when exporting to HOI4 code.
+1. **Save frequently.** There *IS* now an auto-save feature. Backup your files in another folder when exporting to HOI4 code. Auto-save is NOT a replacement for backups and manual saving.
 2. **Toolkit is still in very early development.** Paradox are prone to breaking changes in modding, so, if you notice something out of the ordinary, feel free to stop in to my discord and let me know what's going on!
 
 ---
@@ -58,10 +66,4 @@
 
 ## Technical Details
 
-For technically-inclined users: a list of Python Packages which were used in the creation of the application for your review.
-
-### Standard Library Packages:
-- `os`, `re`, `sys`, `time`, `json`, `uuid`, `typing`, `logging`, `datetime`, `threading`, `subprocess`
-
-### Additional Packages:
-- `PIL`, `PyQt6.QtCore`, `PyQt6.QtGui`, `PyQt6.QtWidgets`
+This has been removed in update 1.0.9 due to needing a major re-examination of all libraries used to ensure total accuracy for users.
