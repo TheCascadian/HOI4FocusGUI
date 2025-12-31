@@ -21,7 +21,7 @@
 ![Project Manager Panel](images/NewProject.png)
 
 ## Generate Focus Tree (Tool)
-![Generate Tree Tool](images/GenerateTreeTool.PNG)
+![Generate Tree Tool](images/GenerateTreeTool.png)
 
 ### Focus Editor Panel (Window)
 ![Focus Editor](images/FocusEditor.PNG)
