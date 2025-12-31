@@ -18,28 +18,28 @@
 ![Main Canvas](images/MainCanvas.PNG)
 
 ## New Project (Project Manager Window)
-![Project Manager Panel](images/NewProject.png)
+![Project Manager Panel](images/NewProject.PNG)
 
 ## Generate Focus Tree (Tool)
-![Generate Tree Tool](images/GenerateTreeTool.png)
+![Generate Tree Tool](images/GenerateTreeTool.PNG)
 
 ### Focus Editor Panel (Window)
-![Focus Editor](images/FocusEditor.png)
+![Focus Editor](images/FocusEditor.PNG)
 
 ### Focus Frames, Notes and Mutex Icons (Optional, Tool, Appearance)
 ![Focus Frames](images/FocusFrames.PNG)
 
 ## Multi Rendering Modes (Customizable)
-![Icons, Default](images/Icon_V_Default.png)
+![Icons, Default](images/Icon_V_Default.PNG)
 
 # Canvas Appearance and Performance (Settings)
-![Appearance & Performance](images/Appearance_Performance.png)
+![Appearance & Performance](images/Appearance_Performance.PNG)
 
 ## Conflicting Keybinds Detection & Display (Configurable)
-![Conflicting Keybinds](images/ConflictingKeybinds.png)
+![Conflicting Keybinds](images/ConflictingKeybinds.PNG)
 
 # Export Mod to HOI4 (Tool)
-![Export to HOI4](images/Export.png)
+![Export to HOI4](images/Export.PNG)
 
 ---
 
