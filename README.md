@@ -18,7 +18,7 @@
 ![Main Canvas](images/MainCanvas.PNG)
 
 ## New Project (Project Manager Window)
-![Project Manager Panel](images/NewProject.PNG)
+![Project Manager Panel](images/NewProject.png)
 
 ## Generate Focus Tree (Tool)
 ![Generate Tree Tool](images/GenerateTreeTool.PNG)
@@ -30,16 +30,16 @@
 ![Focus Frames](images/FocusFrames.PNG)
 
 ## Multi Rendering Modes (Customizable)
-![Icons, Default](images/Icon_V_Default.PNG)
+![Icons, Default](images/Icon_V_Default.png)
 
 # Canvas Appearance and Performance (Settings)
-![Appearance & Performance](images/Appearance_Performance.PNG)
+![Appearance & Performance](images/Appearance_Performance.png)
 
 ## Conflicting Keybinds Detection & Display (Configurable)
-![Conflicting Keybinds](images/ConflictingKeybinds.PNG)
+![Conflicting Keybinds](images/ConflictingKeybinds.png)
 
 # Export Mod to HOI4 (Tool)
-![Export to HOI4](images/Export.PNG)
+![Export to HOI4](images/Export.png)
 
 ---
 
