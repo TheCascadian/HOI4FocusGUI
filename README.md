@@ -67,3 +67,7 @@
 ## Technical Details
 
 This has been removed in update 1.0.9 due to needing a major re-examination of all libraries used to ensure total accuracy for users.
+
+---
+
+![Alt](https://repobeats.axiom.co/api/embed/0a6543f8e7859f3b4781ddb267d53033282751fe.svg "Repobeats analytics image")
