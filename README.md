@@ -65,8 +65,11 @@
 ---
 
 ## Technical Details
+- Previously removed in update 1.0.9 due to needing a major re-examination of all libraries used to ensure total accuracy for users.
 
-This has been removed in update 1.0.9 due to needing a major re-examination of all libraries used to ensure total accuracy for users.
+1. External packages: PyQt6, PIL, numpy, cv2, requests, packaging, pytest
+
+2. Standard library packages: argparse, ast, base64, collections, concurrent, contextlib, ctypes, dataclasses, datetime, functools, hashlib, html, http, importlib, inspect, io, json, logging, math, os, pathlib, random, re, shutil, socketserver, subprocess, sys, tempfile, textwrap, threading, time, traceback, types, typing, unittest, urllib, uuid, weakref, webbrowser, winreg
 
 ---
 
