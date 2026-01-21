@@ -43,6 +43,14 @@
 
 ---
 
+## ⚠️ LINUX USERS
+
+- This application will eventually be rebuilt with Linux in mind, but, for now, the ONLY known Linux distro which runs the tool is CachyOS using WINE.
+- I don't use Linux myself, so I am unsure what that really means, but here is screenshot proof, courtesy of Discord community member turtletortoise.
+![CachyOS + WINE](images/courtesy_of_turtle.png)
+
+---
+
 ## ⚠️ USER WARNING (Norton AV & Windows Defender)
 
 - This will likely be flagged as a virus -- mainly because it is an .exe file made with the use of PyInstaller via AutoPyToExe. Also, I cannot afford to certify this app. 
@@ -72,5 +80,3 @@
 2. Standard library packages: argparse, ast, base64, collections, concurrent, contextlib, ctypes, dataclasses, datetime, functools, hashlib, html, http, importlib, inspect, io, json, logging, math, os, pathlib, random, re, shutil, socketserver, subprocess, sys, tempfile, textwrap, threading, time, traceback, types, typing, unittest, urllib, uuid, weakref, webbrowser, winreg
 
 ---
-
-![Alt](https://repobeats.axiom.co/api/embed/0a6543f8e7859f3b4781ddb267d53033282751fe.svg "Repobeats analytics image")
