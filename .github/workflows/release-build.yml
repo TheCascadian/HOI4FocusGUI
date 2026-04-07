@@ -118,27 +118,23 @@ jobs:
 
           cp -a dist/HOI4FocusGUI/. "$PKG_ROOT/opt/HOI4FocusGUI/"
 
-          cat > "$PKG_ROOT/usr/bin/hoi4focusgui" <<'EOF'
-#!/usr/bin/env bash
-exec /opt/HOI4FocusGUI/HOI4FocusGUI "$@"
-EOF
+          printf '%s\n' '#!/usr/bin/env bash' 'exec /opt/HOI4FocusGUI/HOI4FocusGUI "$@"' > "$PKG_ROOT/usr/bin/hoi4focusgui"
           chmod +x "$PKG_ROOT/usr/bin/hoi4focusgui"
 
           cp packaging/linux/hoi4focusgui.desktop "$PKG_ROOT/usr/share/applications/hoi4focusgui.desktop"
           sed -i 's|^Exec=.*|Exec=/usr/bin/hoi4focusgui|' "$PKG_ROOT/usr/share/applications/hoi4focusgui.desktop"
           cp source/_assets/mutex.png "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps/hoi4focusgui.png"
 
-          cat > "$PKG_ROOT/DEBIAN/control" <<EOF
-Package: ${PKG_NAME}
-Version: ${VERSION}
-Section: utils
-Priority: optional
-Architecture: amd64
-Maintainer: cpntodd <noreply@github.com>
-Depends: libc6, libgl1, libx11-6, libxext6, libxrender1, libxrandr2, libxkbcommon0, libglib2.0-0
-Description: HOI4 Focus GUI
- A visual editor for Hearts of Iron IV focus trees.
-EOF
+          printf '%s\n' \
+            "Package: ${PKG_NAME}" \
+            "Version: ${VERSION}" \
+            "Section: utils" \
+            "Priority: optional" \
+            "Architecture: amd64" \
+            "Maintainer: cpntodd <noreply@github.com>" \
+            "Depends: libc6, libgl1, libx11-6, libxext6, libxrender1, libxrandr2, libxkbcommon0, libglib2.0-0" \
+            "Description: HOI4 Focus GUI" \
+            " A visual editor for Hearts of Iron IV focus trees." > "$PKG_ROOT/DEBIAN/control"
 
           mkdir -p "$OUT_DIR"
           dpkg-deb --build --root-owner-group "$PKG_ROOT"
