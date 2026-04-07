@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish (example: v1.0.10). Required for manual runs.'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -148,7 +153,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
     needs:
       - build-windows-exe
       - build-linux-appimage
@@ -163,6 +168,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           files: |
             release-artifacts/windows-exe/HOI4FocusGUI-windows-x64.zip
