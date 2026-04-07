@@ -1,0 +1,7 @@
+# Runtime dependencies shared by Windows and Linux.
+PyQt6>=6.7
+Pillow>=10.0
+numpy>=1.26
+requests>=2.31
+packaging>=24.0
+opencv-python>=4.10

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.cpntodd.HOI4FocusGUI</id>
+  <name>HOI4 Focus GUI</name>
+  <summary>Hearts of Iron IV focus tree editor</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-Proprietary</project_license>
+  <url type="homepage">https://github.com/cpntodd/HOI4FocusGUI</url>
+  <description>
+    <p>
+      HOI4 Focus GUI is a visual editor for creating and managing Hearts of Iron IV focus trees.
+    </p>
+  </description>
+  <launchable type="desktop-id">hoi4focusgui.desktop</launchable>
+  <categories>
+    <category>Development</category>
+  </categories>
+  <provides>
+    <binary>HOI4FocusGUI</binary>
+  </provides>
+</component>

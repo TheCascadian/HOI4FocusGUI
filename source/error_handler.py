@@ -80,6 +80,7 @@ USAGE PATTERNS:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import traceback
 import time
@@ -1638,16 +1639,21 @@ def configure_error_handler(
     handler = ErrorHandler.get_instance()
     handler.set_gui_parent(gui_parent)
     
-    # Configure logging: prefer file logging to reduce console noise
+    # Configure logging: prefer file logging to reduce console noise.
+    # Reuse startup diagnostic folder if available so all traces land in one file.
     try:
-        logs_root = Path(__file__).resolve().parent / 'logs'
+        env_logs = os.environ.get('FOCUS_LOG_DIR', '').strip()
+        if env_logs:
+            logs_root = Path(env_logs)
+        else:
+            logs_root = Path.cwd() / 'Logs'
         try:
             logs_root.mkdir(parents=True, exist_ok=True)
         except Exception:
-            # Fallback to current directory if logs/ cannot be created
-            logs_root = Path.cwd() / 'logs'
+            # Fallback to user home if current directory is not writable.
+            logs_root = Path.home() / '.focus_tool' / 'Logs'
             logs_root.mkdir(parents=True, exist_ok=True)
-        trace_log = logs_root / 'traceback.log'
+        trace_log = logs_root / 'log.txt'
         fh = logging.FileHandler(trace_log, encoding='utf-8')
         logging.basicConfig(
             level=getattr(logging, log_level.upper(), logging.ERROR),
