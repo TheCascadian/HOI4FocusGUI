@@ -1395,8 +1395,18 @@ class StateViewportDock(QDockWidget):
         undo_stack.push(StateMetaEditCommand(description))
 
     def _focus_appdata_root(self) -> str:
-        root = os.getenv('LOCALAPPDATA') or os.path.expanduser('~')
-        focus_root = os.path.join(root, 'FocusTool')
+        # Use platform-conventional writable data locations.
+        # Windows: LOCALAPPDATA/APPDATA\FocusTool
+        # Linux:   XDG_DATA_HOME/focus_tool or ~/.local/share/focus_tool
+        if sys.platform.startswith('win'):
+            root = os.getenv('LOCALAPPDATA') or os.getenv('APPDATA') or os.path.expanduser('~')
+            focus_root = os.path.join(root, 'FocusTool')
+        else:
+            xdg_data = os.getenv('XDG_DATA_HOME')
+            if xdg_data:
+                focus_root = os.path.join(xdg_data, 'focus_tool')
+            else:
+                focus_root = os.path.join(os.path.expanduser('~'), '.local', 'share', 'focus_tool')
         try:
             os.makedirs(focus_root, exist_ok=True)
         except Exception as e:
@@ -1643,8 +1653,8 @@ class StateViewportDock(QDockWidget):
 
             # Copy files to an AppData temp folder so we can safely manipulate them
             try:
-                local_appdata = os.getenv('LOCALAPPDATA') or os.path.expanduser('~')
-                focus_temp_root = os.path.join(local_appdata, 'FocusTool')
+                # Reuse the same platform-aware app data root for import scratch space.
+                focus_temp_root = self._focus_appdata_root()
                 os.makedirs(focus_temp_root, exist_ok=True)
                 # unique folder per import
                 import uuid

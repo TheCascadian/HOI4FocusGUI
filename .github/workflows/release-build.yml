@@ -1,0 +1,179 @@
+name: Build And Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish (example: v1.0.10). Required for manual runs.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    name: Build Windows EXE
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed `
+            --name HOI4FocusGUI `
+            --add-data "source/_assets;_assets" `
+            --add-data "source/fonts;fonts" `
+            --add-data "source/version.txt;." `
+            source/_focusGUI.py
+
+      - name: Package EXE bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path dist/HOI4FocusGUI/* -DestinationPath artifacts/HOI4FocusGUI-windows-x64.zip -Force
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: artifacts/HOI4FocusGUI-windows-x64.zip
+
+  build-linux-appimage:
+    name: Build Linux AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build AppImage
+        run: |
+          chmod +x scripts/build_appimage.sh
+          ./scripts/build_appimage.sh
+
+      - name: Upload AppImage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: |
+            artifacts/HOI4FocusGUI-x86_64.AppImage
+            artifacts/Launch-HOI4FocusGUI.sh
+            artifacts/Launch-HOI4FocusGUI.desktop
+            artifacts/README-LAUNCH.txt
+
+  build-linux-deb:
+    name: Build Linux DEB
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build Linux app bundle
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name HOI4FocusGUI \
+            --add-data "source/_assets:_assets" \
+            --add-data "source/fonts:fonts" \
+            --add-data "source/version.txt:." \
+            source/_focusGUI.py
+
+      - name: Build .deb package
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="$(cat source/version.txt)"
+          fi
+
+          PKG_NAME="hoi4focusgui"
+          ROOT_DIR="$PWD"
+          PKG_ROOT="$ROOT_DIR/build/deb/${PKG_NAME}_${VERSION}_amd64"
+          OUT_DIR="$ROOT_DIR/artifacts"
+
+          rm -rf "$PKG_ROOT"
+          mkdir -p "$PKG_ROOT/DEBIAN" "$PKG_ROOT/opt/HOI4FocusGUI" "$PKG_ROOT/usr/bin"
+          mkdir -p "$PKG_ROOT/usr/share/applications" "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps"
+
+          cp -a dist/HOI4FocusGUI/. "$PKG_ROOT/opt/HOI4FocusGUI/"
+
+          printf '%s\n' '#!/usr/bin/env bash' 'exec /opt/HOI4FocusGUI/HOI4FocusGUI "$@"' > "$PKG_ROOT/usr/bin/hoi4focusgui"
+          chmod +x "$PKG_ROOT/usr/bin/hoi4focusgui"
+
+          cp packaging/linux/hoi4focusgui.desktop "$PKG_ROOT/usr/share/applications/hoi4focusgui.desktop"
+          sed -i 's|^Exec=.*|Exec=/usr/bin/hoi4focusgui|' "$PKG_ROOT/usr/share/applications/hoi4focusgui.desktop"
+          cp source/_assets/mutex.png "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps/hoi4focusgui.png"
+
+          printf '%s\n' \
+            "Package: ${PKG_NAME}" \
+            "Version: ${VERSION}" \
+            "Section: utils" \
+            "Priority: optional" \
+            "Architecture: amd64" \
+            "Maintainer: cpntodd <noreply@github.com>" \
+            "Depends: libc6, libgl1, libx11-6, libxext6, libxrender1, libxrandr2, libxkbcommon0, libglib2.0-0" \
+            "Description: HOI4 Focus GUI" \
+            " A visual editor for Hearts of Iron IV focus trees." > "$PKG_ROOT/DEBIAN/control"
+
+          mkdir -p "$OUT_DIR"
+          dpkg-deb --build --root-owner-group "$PKG_ROOT"
+          mv "$ROOT_DIR/build/deb/${PKG_NAME}_${VERSION}_amd64.deb" "$OUT_DIR/HOI4FocusGUI_${VERSION}_amd64.deb"
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: artifacts/HOI4FocusGUI_*_amd64.deb
+
+  create-release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+    needs:
+      - build-windows-exe
+      - build-linux-appimage
+      - build-linux-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-artifacts/windows-exe/HOI4FocusGUI-windows-x64.zip
+            release-artifacts/linux-appimage/HOI4FocusGUI-x86_64.AppImage
+            release-artifacts/linux-appimage/Launch-HOI4FocusGUI.sh
+            release-artifacts/linux-appimage/Launch-HOI4FocusGUI.desktop
+            release-artifacts/linux-appimage/README-LAUNCH.txt
+            release-artifacts/linux-deb/*.deb

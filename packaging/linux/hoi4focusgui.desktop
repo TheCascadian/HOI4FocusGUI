@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=HOI4 Focus GUI
+Comment=Hearts of Iron IV focus tree editor
+Exec=HOI4FocusGUI
+Icon=hoi4focusgui
+Terminal=false
+Categories=Development;IDE;
+StartupNotify=true

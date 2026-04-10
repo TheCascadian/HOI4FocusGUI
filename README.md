@@ -43,10 +43,27 @@
 
 ---
 
-## ⚠️ LINUX USERS
+## LINUX SUPPORT STATUS
 
-- This application will eventually be rebuilt with Linux in mind, but, for now, the ONLY known Linux distro which runs the tool is CachyOS using WINE.
-- I don't use Linux myself, so I am unsure what that really means, but here is screenshot proof, courtesy of Discord community member turtletortoise.
+- Linux packaging support is now included in this repository.
+- GitHub release builds are configured to generate:
+- Windows build artifact (`.zip` bundle containing `.exe`).
+- Linux `.AppImage`.
+- Linux `.deb`.
+- Linux startup diagnostics now write to `Logs/log.txt` so launch problems are easier to troubleshoot.
+
+### AppImage Runtime Requirement
+
+- Direct AppImage launch requires FUSE2 compatibility (`libfuse.so.2`; on newer Debian-based systems this is typically `libfuse2t64`).
+- If FUSE2 is missing, AppImage launch can fail before the app UI appears.
+- A fallback launcher script may be generated with local builds for no-FUSE testing (`APPIMAGE_EXTRACT_AND_RUN=1` mode).
+
+### Release Flow
+
+- Push to `main` for regular code updates.
+- Push a tag that starts with `v` (example: `v1.0.10`) to trigger full release artifact generation.
+- Manual workflow dispatch is also supported when providing a release tag input.
+
 ![CachyOS + WINE](images/courtesy_of_turtle.png)
 
 ---

@@ -153,8 +153,9 @@ A visual editor for creating Hearts of Iron IV focus trees with improved UX
 Includes a reusable Focus Library (dictionary) for saving/applying focus property snippets.
 """
 
-GITHUB_REPO_OWNER = "TheCascadian"
-GITHUB_REPO_NAME = "HOI4FocusGUI"
+# Keep upstream defaults, but allow forks/CI to override without patching code.
+GITHUB_REPO_OWNER = os.environ.get("FOCUS_GITHUB_REPO_OWNER", "TheCascadian")
+GITHUB_REPO_NAME = os.environ.get("FOCUS_GITHUB_REPO_NAME", "HOI4FocusGUI")
 
 #region Mute App patch
 # Monkeypatch QMessageBox helpers so they respect an application-wide `muted` flag
@@ -6352,6 +6353,11 @@ class HOI4FocusTreeGenerator(QMainWindow):
         help_menu = QMenu("Help", self)
         check_update_action = QAction("Check for Updates...", self)
         check_update_action.triggered.connect(self.check_for_updates)
+        # The built-in updater currently downloads Windows .exe assets only.
+        # Keep the action visible on Linux but disable it with a clear message.
+        if not sys.platform.startswith('win'):
+            check_update_action.setEnabled(False)
+            check_update_action.setToolTip("Self-update is currently Windows-only. Use your package manager/AppImage release on Linux.")
         help_menu.addAction(check_update_action)
         try:
             self.menuBar().addMenu(help_menu)
@@ -6670,6 +6676,16 @@ class HOI4FocusTreeGenerator(QMainWindow):
 
     def check_for_updates(self):
         """Check for updates in background thread"""
+        # Guard Linux/macOS from entering the Windows-only updater flow.
+        if not sys.platform.startswith('win'):
+            QMessageBox.information(
+                self,
+                "Updater Not Available",
+                "In-app updates are currently Windows-only.\n"
+                "On Linux, please update through your package manager or by downloading a new AppImage release.",
+            )
+            return
+
         print("DEBUG: check_for_updates called")
 
         if GitHubUpdater is None:
@@ -6679,8 +6695,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
         self.statusBar().showMessage("Checking for updates...")
 
         # Create updater on main thread
-        OWNER = "TheCascadian"
-        REPO = "HOI4FocusGUI"
+        OWNER = GITHUB_REPO_OWNER
+        REPO = GITHUB_REPO_NAME
         CURRENT_VERSION = self.app_version  # Use loaded version from version.txt
 
         updater = GitHubUpdater(OWNER, REPO, CURRENT_VERSION)
@@ -7328,7 +7344,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
     def detect_app_base_dir(self):
         """Detect a reasonable application base directory using platform conventions.
 
-        Windows: use %LOCALAPPDATA%\FocusTool or %APPDATA% if LOCALAPPDATA not available.
+        Windows: use %LOCALAPPDATA%\\FocusTool or %APPDATA% if LOCALAPPDATA not available.
         *NIX: use XDG_DATA_HOME or ~/.local/share/focus_tool
         Falls back to current working directory.
         """
@@ -13387,7 +13403,85 @@ class HOI4FocusTreeGenerator(QMainWindow):
 #endregion
 
 # Main entry point
+class _LoggerStream:
+    """Small stream wrapper that redirects print/trace output into logging.
+
+    We keep this tiny and explicit so startup diagnostics are easy to follow.
+    """
+    def __init__(self, log_fn):
+        self._log_fn = log_fn
+
+    def write(self, message):
+        text = str(message).strip()
+        if text:
+            self._log_fn(text)
+
+    def flush(self):
+        return
+
+
+def _setup_diagnostic_logging() -> Optional[str]:
+    """Create a Logs folder and wire diagnostics to Logs/log.txt.
+
+    This runs before QApplication startup so AppImage launch issues are
+    captured even when the UI never appears.
+    """
+    try:
+        appimage_path = os.environ.get('APPIMAGE', '').strip()
+        appimage_logs = None
+        if appimage_path:
+            try:
+                appimage_logs = Path(appimage_path).resolve().parent / 'Logs'
+            except Exception:
+                appimage_logs = None
+
+        candidates = [
+            # Prefer placing diagnostics beside the AppImage users launched.
+            appimage_logs,
+            Path.cwd() / 'Logs',
+            Path.home() / '.focus_tool' / 'Logs',
+            Path(tempfile.gettempdir()) / 'FocusTool' / 'Logs',
+        ]
+
+        log_dir = None
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                log_dir = candidate
+                break
+            except Exception:
+                continue
+
+        if log_dir is None:
+            return None
+
+        # Expose path for other modules so they can reuse one log location.
+        os.environ['FOCUS_LOG_DIR'] = str(log_dir)
+        log_file = log_dir / 'log.txt'
+
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+
+        logging.basicConfig(level=logging.INFO, handlers=[file_handler], force=True)
+        logger.info('Diagnostic logging initialized at %s', log_file)
+
+        # Route print statements and uncaught exceptions to the diagnostics log.
+        sys.stdout = _LoggerStream(logger.info)
+        sys.stderr = _LoggerStream(logger.error)
+
+        def _log_uncaught(exc_type, exc_val, exc_tb):
+            logging.getLogger(__name__).critical('Uncaught exception', exc_info=(exc_type, exc_val, exc_tb))
+
+        sys.excepthook = _log_uncaught
+        return str(log_file)
+    except Exception:
+        return None
+
+
 def main():
+    _setup_diagnostic_logging()
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("HOI4 Focus GUI")
