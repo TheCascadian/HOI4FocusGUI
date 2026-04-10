@@ -41,6 +41,12 @@
 # Export Mod to HOI4 (Tool)
 ![Export to HOI4](images/Export.png)
 
+# Linux Main Menu
+![Linux Main Menu](images/main-menu-linux-260410.png)
+
+# Linux Focus Render
+![Linux Focus Render](images/linux-render.png)
+
 ---
 
 ## LINUX SUPPORT STATUS
