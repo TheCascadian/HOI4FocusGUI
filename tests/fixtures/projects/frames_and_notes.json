@@ -1,0 +1,48 @@
+{
+  "version": "1.0.9",
+  "tree_id": "frames_notes_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {"id": "focus_one", "name": "Focus One", "x": 0, "y": 0}
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {
+    "canvas": {
+      "frames_enabled": true,
+      "notes_enabled": true
+    },
+    "preferences": {"prefer_app_settings": false}
+  },
+  "note_defaults": {
+    "title_size": 11,
+    "body_size": 11,
+    "title_color": "#141414",
+    "text_color": "#1E1E1E",
+    "bg_color": "#FFF7D2",
+    "connection_color": "#5A5A5A",
+    "connection_width": 2
+  },
+  "notes": [
+    {
+      "id": "note-1",
+      "title": "Reminder",
+      "text": "Double-check AI weights on this branch.",
+      "x": 150.0,
+      "y": -80.0,
+      "w": 260.0,
+      "h": 120.0,
+      "color": "#fffff7d2",
+      "title_size": 11,
+      "body_size": 11,
+      "title_color": "#ff141414",
+      "text_color": "#ff1e1e1e"
+    }
+  ],
+  "note_connections": [],
+  "note_focus_links": [["note-1", "focus_one"]],
+  "note_event_links": [],
+  "event_focus_links": [],
+  "event_event_links": [],
+  "events": []
+}

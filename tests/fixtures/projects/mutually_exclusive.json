@@ -1,0 +1,22 @@
+{
+  "version": "1.0.9",
+  "tree_id": "mutex_focus_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {"id": "path_army", "name": "Army Path", "x": -1, "y": 0,
+     "mutually_exclusive": ["path_navy"]},
+    {"id": "path_navy", "name": "Navy Path", "x": 1, "y": 0,
+     "mutually_exclusive": ["path_army"]}
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {"canvas": {}, "preferences": {"prefer_app_settings": false}},
+  "note_defaults": {},
+  "notes": [],
+  "note_connections": [],
+  "note_focus_links": [],
+  "note_event_links": [],
+  "event_focus_links": [],
+  "event_event_links": [],
+  "events": []
+}

@@ -1,15 +1,43 @@
-from _imports import (
-    # Standard library
-    os, wraps,
-)
+"""Shared utility helpers (decorators, formatting, obfuscation, painting).
 
+Dependency rules for this module:
+    - It may import ``_dataStructs`` (domain) and ``error_handler`` (neutral).
+    - It must never import ``_imports`` or any GUI module (``_focusGUI``,
+      ``_dialog``, ...). Error presentation goes through the presenter
+      registered in ``_error_presenter``.
+"""
+
+import importlib.util
+import logging
+import os
+import re
+import traceback
+from functools import wraps
+from typing import Optional
+
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import QMessageBox, QWidget
+
+from _dataStructs import Focus
+from _error_presenter import get_error_presenter
 from error_handler import ErrorPolicy, PolicyConfig, handle_exception, silent_operation
 
+logger = logging.getLogger(__name__)
 
-# Prevent _imports from re-importing _utils during setup.
-os.environ["FOCUS_SKIP_UTILS"] = "1"
-from _imports import *
-os.environ.pop("FOCUS_SKIP_UTILS", None)
+# Pillow is an optional runtime dependency. Probe for it without importing so
+# that no ImportError has to be suppressed.
+_PILLOW_AVAILABLE = importlib.util.find_spec("PIL") is not None
 
 # region Performance & Safety Decorators
 
@@ -74,28 +102,37 @@ def safe_qt_call(default_return=None):
 # region Error Handling & UI Utilities
 
 def show_error(parent: Optional[QWidget], title: str, message: str, exc: Optional[BaseException] = None):
-    """Show an error dialog with optional traceback details, obfuscating sensitive paths."""
+    """Show an error dialog with optional traceback details, obfuscating sensitive paths.
+
+    Presentation is delegated to the presenter installed via
+    ``_error_presenter.set_error_presenter`` (the GUI layer registers a rich
+    ErrorDialog at start-up). When no presenter is installed, or it declines or
+    fails, this falls back to a plain QMessageBox.
+    """
     details = None
     try:
         if exc is not None:
-            import traceback
             details = traceback.format_exc()
     except Exception:
         details = None
-    try:
-        try: from _focusGUI import ErrorDialog
-        except Exception: logger.error("ErrorDialog class not found in _focusGUI module.")
-        dlg = ErrorDialog(title=title, message=message, details=details, parent=parent)
-        dlg.exec()
-    except Exception:
-        # Fallback to QMessageBox (still obfuscate)
+
+    presenter = get_error_presenter()
+    if presenter is not None:
         try:
-            QMessageBox.critical(parent, title or "Error", obfuscate_text(message))
+            if presenter(parent, title, message, details):
+                return
         except Exception:
-            try:
-                logger.exception("Failed to show error via QMessageBox")
-            except Exception as e:
-                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            with silent_operation("Log error presenter failure"):
+                logger.exception("Registered error presenter failed; using fallback")
+
+    # Fallback to QMessageBox (still obfuscate)
+    try:
+        QMessageBox.critical(parent, title or "Error", obfuscate_text(message))
+    except Exception:
+        try:
+            logger.exception("Failed to show error via QMessageBox")
+        except Exception as e:
+            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
 def format_project_file_size(size: int | str | None = None, *, precision: int = 1, show_bytes: bool = False) -> str:
     """Format a file size for display in the Project Manager UI.
@@ -162,8 +199,10 @@ def pixmap_from_file_via_pillow(path: str) -> Optional[QPixmap]:
 
     Returns QPixmap on success, or None on failure. Requires Pillow to be installed.
     """
-    if Image is None:
+    if not _PILLOW_AVAILABLE:
         return None
+    from PIL import Image
+
     try:
         im = Image.open(path)
         # Ensure RGBA
@@ -242,16 +281,13 @@ def set_widget_path_display(widget, path: Optional[str], max_len: int = 80):
 
 # region Focus Cloning Utilities
 
-def clone_focus_pure(src) -> 'Focus':
+def clone_focus_pure(src) -> Focus:
     """Create a clean Focus clone using only dataclass fields (no Qt caches).
 
     This avoids deepcopy() issues with non-picklable attributes like QPixmap that may be
     set as ad-hoc attributes on Focus objects by the UI.
     Updated to dynamically copy all dataclass fields to remain future-proof.
     """
-    # Lazy import to avoid circular import issues
-    from _dataStructs import Focus
-
     try:
         clone_data = {}
         # dataclasses expose __dataclass_fields__ mapping

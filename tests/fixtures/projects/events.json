@@ -1,0 +1,29 @@
+{
+  "version": "1.0.9",
+  "tree_id": "events_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {"id": "trigger_focus", "name": "Trigger Focus", "x": 0, "y": 0}
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {"canvas": {}, "preferences": {"prefer_app_settings": false}},
+  "note_defaults": {},
+  "notes": [],
+  "note_connections": [],
+  "note_focus_links": [],
+  "note_event_links": [],
+  "event_focus_links": [["news.1", "trigger_focus"]],
+  "event_event_links": [],
+  "events": [
+    {
+      "id": "news.1",
+      "title": "A Grave Decision",
+      "description": "The nation must choose its path.",
+      "x": 2,
+      "y": 0,
+      "trigger": "is_puppet = no",
+      "options_block": "option = {\n\tname = news.1.a\n\tai_chance = { factor = 50 }\n}\noption = {\n\tname = news.1.b\n\tai_chance = { factor = 50 }\n}"
+    }
+  ]
+}

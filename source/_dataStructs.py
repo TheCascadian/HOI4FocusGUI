@@ -1,21 +1,20 @@
-from _imports import (
-    # Standard library
-    os,
-)
+"""Domain data structures for focus trees, events, and the GUI editor.
+
+This module is deliberately Qt-free and depends only on the standard library
+and ``error_handler``. Nothing here may import ``_imports``, ``_utils``, or any
+GUI module: those depend on these structures, not the other way around.
+"""
 
 import logging
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
+
 from error_handler import silent_operation
 
-
-# Avoid circular import when _imports tries to pull _dataStructs types.
-# Set the environment flag BEFORE importing _imports so it won't try to import
-# this module while it is still being initialized.
-os.environ["FOCUS_SKIP_DATASTRUCTS"] = "1"
-from _imports import *
-os.environ.pop("FOCUS_SKIP_DATASTRUCTS", None)
-
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+if TYPE_CHECKING:
+    # Annotation-only: importing PyQt6 at runtime would make the domain layer
+    # depend on the GUI toolkit.
+    from PyQt6.QtGui import QShortcut
 
 logger = logging.getLogger(__name__)
 

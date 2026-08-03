@@ -8,3 +8,14 @@ artifacts/
 squashfs-root/
 Logs/
 *.spec
+
+# AI Assisted Development Tools (i know, i'm awful)
+.claude/
+*.claude/
+
+PROMPTS.md
+CHANGES-INTERNAL.md
+
+# Testing
+.pytest_cache/*
+*.pytest_cache/

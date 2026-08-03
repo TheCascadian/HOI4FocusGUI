@@ -1,0 +1,78 @@
+focus_tree = {
+	id = sample_focus_tree
+	country = {
+		factor = 0
+		modifier = {
+			add = 10
+			tag = GER
+		}
+	}
+	default = no
+	continuous_focus_position = { x = 50 y = 50 }
+
+	focus = {
+		id = sample_root
+		icon = GFX_goal_generic_construct_infrastructure
+		x = 0
+		y = 0
+		cost = 10
+		available_if_capitulated = no
+
+		ai_will_do = {
+			factor = 5
+		}
+
+		completion_reward = {
+			add_political_power = 50
+		}
+	}
+
+	focus = {
+		id = sample_army_path
+		icon = GFX_goal_generic_allies_build_infantry
+		x = -2
+		y = 1
+		cost = 7
+		prerequisite = { focus = sample_root }
+		mutually_exclusive = { focus = sample_navy_path }
+
+		available = {
+			has_completed_focus = sample_root
+		}
+
+		completion_reward = {
+			army_experience = 20
+		}
+	}
+
+	focus = {
+		id = sample_navy_path
+		icon = GFX_goal_generic_navy_doctrine
+		x = 2
+		y = 1
+		cost = 7
+		prerequisite = { focus = sample_root }
+		mutually_exclusive = { focus = sample_army_path }
+
+		completion_reward = {
+			navy_experience = 20
+		}
+	}
+
+	focus = {
+		id = sample_hidden_focus
+		icon = GFX_goal_generic_position_hidden
+		x = 0
+		y = 2
+		cost = 5
+		prerequisite = { focus = sample_army_path focus = sample_navy_path }
+
+		visible = {
+			has_government = fascism
+		}
+
+		completion_reward = {
+			add_stability = 0.05
+		}
+	}
+}

@@ -1,4 +1,10 @@
-"""Common imports for the project.
+"""Common imports for the project (compatibility facade).
+
+STATUS: legacy. This module is retained only so that modules which have not yet
+been converted to explicit imports keep working. Do not add new dependents, and
+do not import it from ``_dataStructs``, ``_utils``, ``_exporter``, or
+``_import_pipeline`` — those modules now use explicit imports and importing this
+facade from them would re-introduce the import cycle it used to paper over.
 
 This module acts as a centralized, well-documented imports facade for
 shared runtime symbols used across the project. It consolidates repeated
@@ -258,112 +264,68 @@ from PyQt6.QtGui import (
 # =============================================================================
 # Optional Third-Party
 # =============================================================================
-try:
+# Pillow and numpy are genuinely optional at runtime; consumers test these for
+# ``None`` before use. Availability is probed with ``find_spec`` so that a real
+# ImportError raised *inside* an installed package still propagates instead of
+# being silently downgraded to "not installed".
+import importlib.util
+
+if importlib.util.find_spec("PIL") is not None:
     from PIL import Image
-except ImportError:
+else:
     Image = None  # type: ignore
 
-try:
+if importlib.util.find_spec("numpy") is not None:
     import numpy as np
-except ImportError:
+else:
     np = None  # type: ignore
-
-# =============================================================================
-# Environment-controlled optional imports
-# =============================================================================
-_skip_data_structs = os.environ.get("FOCUS_SKIP_DATASTRUCTS") == "1"
-_skip_utils = os.environ.get("FOCUS_SKIP_UTILS") == "1"
 
 # =============================================================================
 # Project Data Structures
 # =============================================================================
-if TYPE_CHECKING:
-    # For type checkers: always import the real types
-    from _dataStructs import Focus, Event, CommandSpec
-else:
-    # For runtime: try to import, fall back to None if missing
-    if not _skip_data_structs:
-        try:
-            from _dataStructs import Focus, Event, CommandSpec
-        except ImportError:
-            logger.warning("Failed to import _dataStructs; setting placeholders.")
-            Focus = Event = CommandSpec = None  # type: ignore
-    else:
-        Focus = Event = CommandSpec = None  # type: ignore
+# ``_dataStructs`` depends only on the standard library and ``error_handler``,
+# so this is an unconditional import: a failure here is a real error and must
+# not be masked by a placeholder ``None``.
+from _dataStructs import Focus, Event, CommandSpec
 
 # =============================================================================
 # Utility Helpers
 # =============================================================================
-if TYPE_CHECKING:
-    # For type checkers: always import the real functions
-    from _utils import (
-        clone_focus_pure,
-        draw_outlined_text,
-        format_project_file_size,
-        obfuscate_path,
-        obfuscate_text,
-        obfuscate_user_in_path,
-        pixmap_from_file_via_pillow,
-        safe_qt_call,
-        safe_ui_operation,
-        set_widget_path_display,
-        show_error,
-    )
-else:
-    # For runtime: try to import, fall back to None if missing
-    if not _skip_utils:
-        try:
-            from _utils import (
-                clone_focus_pure,
-                draw_outlined_text,
-                format_project_file_size,
-                obfuscate_path,
-                obfuscate_text,
-                obfuscate_user_in_path,
-                pixmap_from_file_via_pillow,
-                safe_qt_call,
-                safe_ui_operation,
-                set_widget_path_display,
-                show_error,
-            )
-        except ImportError:
-            logger.warning("Failed to import helpers from _utils; falling back to no-ops.")
-            clone_focus_pure = None  # type: ignore
-            draw_outlined_text = None  # type: ignore
-            format_project_file_size = None  # type: ignore
-            obfuscate_path = None  # type: ignore
-            obfuscate_text = None  # type: ignore
-            obfuscate_user_in_path = None  # type: ignore
-            pixmap_from_file_via_pillow = None  # type: ignore
-            safe_qt_call = None  # type: ignore
-            safe_ui_operation = None  # type: ignore
-            set_widget_path_display = None  # type: ignore
-            show_error = None  # type: ignore
-    else:
-        clone_focus_pure = None  # type: ignore
-        draw_outlined_text = None  # type: ignore
-        format_project_file_size = None  # type: ignore
-        obfuscate_path = None  # type: ignore
-        obfuscate_text = None  # type: ignore
-        obfuscate_user_in_path = None  # type: ignore
-        pixmap_from_file_via_pillow = None  # type: ignore
-        safe_qt_call = None  # type: ignore
-        safe_ui_operation = None  # type: ignore
-        set_widget_path_display = None  # type: ignore
-        show_error = None  # type: ignore
+# ``_utils`` depends on ``_dataStructs`` + PyQt6 and never imports this facade,
+# so this too is a plain import with no fallbacks.
+from _utils import (
+    clone_focus_pure,
+    draw_outlined_text,
+    format_project_file_size,
+    obfuscate_path,
+    obfuscate_text,
+    obfuscate_user_in_path,
+    pixmap_from_file_via_pillow,
+    safe_qt_call,
+    safe_ui_operation,
+    set_widget_path_display,
+    show_error,
+)
 
 # =============================================================================
-# Optional Converters
+# Converters (resolved lazily)
 # =============================================================================
+# ``_txt_converter`` still imports this facade, so importing it here at module
+# scope would re-create a cycle. Resolve it on first attribute access instead:
+# ``from _imports import convert_txt_to_project_dict`` keeps working, and a
+# genuinely broken ``_txt_converter`` raises instead of yielding ``None``.
 if TYPE_CHECKING:
-    # For type checkers: always import the real function
     from _txt_converter import convert_txt_to_project_dict
-else:
-    # For runtime: try to import, fall back to None if missing
-    try:
-        from _txt_converter import convert_txt_to_project_dict
-    except ImportError:
-        convert_txt_to_project_dict = None  # type: ignore
+
+
+def __getattr__(name: str):
+    """Resolve lazily-exported names (PEP 562)."""
+    if name == "convert_txt_to_project_dict":
+        from _txt_converter import convert_txt_to_project_dict as _converter
+
+        globals()[name] = _converter
+        return _converter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # =============================================================================
 # Public Export Surface

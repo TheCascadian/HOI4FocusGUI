@@ -1,0 +1,23 @@
+{
+  "version": "1.0.9",
+  "tree_id": "basic_focus_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {"id": "root_focus", "name": "Root Focus", "x": 0, "y": 0, "cost": 10},
+    {"id": "child_focus", "name": "Child Focus", "x": 1, "y": 1, "cost": 7,
+     "description": "Follows the root focus.", "prerequisites": ["root_focus"]},
+    {"id": "grandchild_focus", "name": "Grandchild Focus", "x": 1, "y": 2, "cost": 5,
+     "prerequisites": ["child_focus"]}
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {"canvas": {}, "preferences": {"prefer_app_settings": false}},
+  "note_defaults": {},
+  "notes": [],
+  "note_connections": [],
+  "note_focus_links": [],
+  "note_event_links": [],
+  "event_focus_links": [],
+  "event_event_links": [],
+  "events": []
+}

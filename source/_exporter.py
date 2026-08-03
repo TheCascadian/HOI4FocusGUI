@@ -5,17 +5,11 @@ Converts FocusTree dataclass instances back to .txt format
 Also exports HOI4 state files from edited state metadata
 """
 
-from _imports import (
-    # Standard library
-    os, re,
-    # Typing
-    Any, Dict, List, Optional, Tuple,
-    # Project
-    Focus,
-)
-
 import logging
-from _dataStructs import Focus, FocusBranch, FocusTree
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 from _dataStructs import Focus, FocusBranch, FocusTree
 
 

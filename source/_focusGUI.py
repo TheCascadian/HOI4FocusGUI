@@ -65,6 +65,7 @@ from _dialog import (
 )
 
 from _txt_converter import convert_txt_to_project_dict
+from _error_presenter import set_error_presenter
 
 
 StateViewportDock = None
@@ -853,6 +854,25 @@ class ErrorDialog(EditorDialogBase): # Central error reporting dialog with copy 
         btns.addWidget(copy_btn)
         btns.addWidget(close_btn)
         layout.addLayout(btns)
+
+
+def _present_error_dialog(
+    parent: Optional[QWidget],
+    title: str,
+    message: str,
+    details: Optional[str] = None,
+) -> bool:
+    """Application-level error presenter backed by :class:`ErrorDialog`.
+
+    Registered with ``_error_presenter`` at import time so that ``_utils`` can
+    show rich errors without importing this GUI module.
+    """
+    ErrorDialog(title=title, message=message, details=details, parent=parent).exec()
+    return True
+
+
+set_error_presenter(_present_error_dialog)
+
 
 class KeybindsOverlay(QWidget):
     """A lightweight, always-on-top overlay that lists currently active keybindings.

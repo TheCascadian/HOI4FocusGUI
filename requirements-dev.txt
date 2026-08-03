@@ -1,0 +1,7 @@
+# Development/test-only dependencies.
+# Install runtime deps too via -r so a single `pip install -r requirements-dev.txt`
+# is enough to run the test suite.
+-r requirements.txt
+
+pytest>=8.0
+pytest-qt>=4.4

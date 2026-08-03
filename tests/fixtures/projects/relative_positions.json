@@ -1,0 +1,21 @@
+{
+  "version": "1.0.9",
+  "tree_id": "relative_position_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {"id": "anchor", "name": "Anchor Focus", "x": 0, "y": 0},
+    {"id": "relative_child", "name": "Relative Child", "x": 0, "y": 1,
+     "prerequisites": ["anchor"], "relative_position_id": "anchor"}
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {"canvas": {}, "preferences": {"prefer_app_settings": false}},
+  "note_defaults": {},
+  "notes": [],
+  "note_connections": [],
+  "note_focus_links": [],
+  "note_event_links": [],
+  "event_focus_links": [],
+  "event_event_links": [],
+  "events": []
+}

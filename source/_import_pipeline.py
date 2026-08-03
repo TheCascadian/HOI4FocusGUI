@@ -16,14 +16,11 @@ This file implements the recommendations given in the user prompt.
 
 from __future__ import annotations
 
-from _imports import (
-    # Standard library
-    re,
-    # Typing
-    Any, Dict, List, Optional, Tuple,
-)
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
 from _txt_converter import TxtFocusParser
 
 

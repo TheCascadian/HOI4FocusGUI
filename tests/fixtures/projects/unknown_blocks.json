@@ -1,0 +1,33 @@
+{
+  "version": "1.0.9",
+  "tree_id": "unknown_blocks_tree",
+  "country_tag": "GER",
+  "focuses": [
+    {
+      "id": "future_focus",
+      "name": "Future Focus",
+      "x": 0,
+      "y": 0,
+      "raw_unparsed": [
+        "some_future_paradox_block = {\n\tunknown_key = yes\n}",
+        "another_unrecognized_field = 42"
+      ],
+      "has_unparsed": true,
+      "clean_raw": "focus = {\n\tid = future_focus\n\tname = future_focus\n}"
+    }
+  ],
+  "library": {},
+  "icon_library": {},
+  "settings": {"canvas": {}, "preferences": {"prefer_app_settings": false}},
+  "note_defaults": {},
+  "notes": [],
+  "note_connections": [],
+  "note_focus_links": [],
+  "note_event_links": [],
+  "event_focus_links": [],
+  "event_event_links": [],
+  "events": [],
+  "_unrecognized_future_top_level_key": {
+    "note": "Unknown top-level data from a future app version; loader must not crash on this."
+  }
+}
