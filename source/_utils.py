@@ -65,8 +65,7 @@ def safe_ui_operation(default_return=None, log_errors=False):
                 return func(*args, **kwargs)
             except Exception as e:
                 if log_errors:
-                    with silent_operation("Log safe_ui_operation failure"):
-                        logger.debug(f"{func.__name__} failed gracefully: {e}")
+                    logger.debug(f"{func.__name__} failed gracefully: {e}")
                 return default_return
         return wrapper
     return decorator
@@ -122,8 +121,7 @@ def show_error(parent: Optional[QWidget], title: str, message: str, exc: Optiona
             if presenter(parent, title, message, details):
                 return
         except Exception:
-            with silent_operation("Log error presenter failure"):
-                logger.exception("Registered error presenter failed; using fallback")
+            logger.exception("Registered error presenter failed; using fallback")
 
     # Fallback to QMessageBox (still obfuscate)
     try:
@@ -143,7 +141,7 @@ def format_project_file_size(size: int | str | None = None, *, precision: int = 
     - If `show_bytes` is True, the exact byte count is appended in parentheses.
 
     Returns a short human-readable string like "1.2 MB" or "1.2 MB (1,234,567 B)".
-    For unknown or invalid inputs the function returns '—'.
+    For unknown or invalid inputs the function returns '-'.
     """
     try:
         # Resolve path -> bytes if needed
@@ -155,15 +153,15 @@ def format_project_file_size(size: int | str | None = None, *, precision: int = 
                     # try to parse numeric strings
                     size = int(size)
             except Exception:
-                return '—'
+                return '-'
         if size is None:
-            return '—'
+            return '-'
         try:
             b = int(size)
         except Exception:
-            return '—'
+            return '-'
         if b < 0:
-            return '—'
+            return '-'
         # simple quick path for zero
         if b == 0:
             return '0 B' if not show_bytes else '0 B (0 B)'
@@ -186,39 +184,44 @@ def format_project_file_size(size: int | str | None = None, *, precision: int = 
             human = f"{human} ({b:,} B)"
         return human
     except Exception:
-        with silent_operation("Log format_project_file_size failure"):
-            logger.exception("format_project_file_size failed")
-        return '—'
+        logger.exception("format_project_file_size failed")
+        return '-'
 
 # endregion
 
 # region Pixmap Loading Utilities
+
+_MISSING_IMAGE_PATHS: set = set()
+
 
 def pixmap_from_file_via_pillow(path: str) -> Optional[QPixmap]:
     """Attempt to load image via Pillow and convert to QPixmap.
 
     Returns QPixmap on success, or None on failure. Requires Pillow to be installed.
     """
-    if not _PILLOW_AVAILABLE:
+    if not _PILLOW_AVAILABLE or not path:
+        return None
+    if path in _MISSING_IMAGE_PATHS:
+        return None
+    if not os.path.isfile(path):
+        _MISSING_IMAGE_PATHS.add(path)
+        logger.debug("pixmap_from_file_via_pillow: missing image %s", path)
         return None
     from PIL import Image
 
     try:
-        im = Image.open(path)
-        # Ensure RGBA
-        if im.mode != 'RGBA':
-            im = im.convert('RGBA')
-        data = im.tobytes('raw', 'RGBA')
-        w, h = im.size
+        with Image.open(path) as im:
+            if im.mode != 'RGBA':
+                im = im.convert('RGBA')
+            data = im.tobytes('raw', 'RGBA')
+            w, h = im.size
         qimg = QImage(data, w, h, QImage.Format.Format_RGBA8888)
         pix = QPixmap.fromImage(qimg)
         # tag for comparison
-        with silent_operation("Set pixmap path attribute"):
-            setattr(pix, 'path', path)
+        setattr(pix, 'path', path)
         return pix
     except Exception:
-        with silent_operation("Log pixmap_from_file_via_pillow failure"):
-            logger.exception("pixmap_from_file_via_pillow failed")
+        logger.exception("pixmap_from_file_via_pillow failed for %s", path)
         return None
 
 # endregion
@@ -238,10 +241,9 @@ def shorten_path_for_display(path: Optional[str], max_len: int = 80) -> str:
             return ''
         p = str(path)
         # Prefer obfuscated home display when available
-        with silent_operation("Try obfuscated home display"):
-            home = os.path.expanduser('~')
-            if home and p.startswith(home) and 'obfuscate_user_in_path' in globals():
-                return obfuscate_user_in_path(p)
+        home = os.path.expanduser('~')
+        if home and p.startswith(home) and 'obfuscate_user_in_path' in globals():
+            return obfuscate_user_in_path(p)
         if len(p) <= max_len:
             return p
         base = os.path.basename(p)
@@ -256,8 +258,7 @@ def shorten_path_for_display(path: Optional[str], max_len: int = 80) -> str:
             return f"{drive}{os.path.sep}...{os.path.sep}{base}"
         return f"...{os.path.sep}{base}"
     except Exception:
-        with silent_operation("Log shorten_path_for_display failure"):
-            logger.exception("shorten_path_for_display failed")
+        logger.exception("shorten_path_for_display failed")
         return str(path) if path is not None else ''
 
 def set_widget_path_display(widget, path: Optional[str], max_len: int = 80):
@@ -272,10 +273,9 @@ def set_widget_path_display(widget, path: Optional[str], max_len: int = 80):
         if hasattr(widget, 'setToolTip'):
             widget.setToolTip(str(path or ''))
     except Exception:
-        with silent_operation("set_widget_path_display fallback"):
-            if hasattr(widget, 'setText'):
-                widget.setText(str(path or ''))
-            logger.exception("set_widget_path_display failed; used fallback")
+        if hasattr(widget, 'setText'):
+            widget.setText(str(path or ''))
+        logger.exception("set_widget_path_display failed; used fallback")
 
 # endregion
 
@@ -293,23 +293,20 @@ def clone_focus_pure(src) -> Focus:
         # dataclasses expose __dataclass_fields__ mapping
         fields = getattr(type(src), '__dataclass_fields__', {})
         for fname in fields:
-            with silent_operation(f"Clone field {fname}"):
-                val = getattr(src, fname)
-                if isinstance(val, list):
-                    clone_data[fname] = list(val)
-                elif isinstance(val, dict):
-                    clone_data[fname] = dict(val)
-                elif isinstance(val, set):
-                    clone_data[fname] = set(val)
-                else:
-                    clone_data[fname] = val
+            val = getattr(src, fname)
+            if isinstance(val, list):
+                clone_data[fname] = list(val)
+            elif isinstance(val, dict):
+                clone_data[fname] = dict(val)
+            elif isinstance(val, set):
+                clone_data[fname] = set(val)
+            else:
+                clone_data[fname] = val
         return Focus(**clone_data)
     except Exception as e:
-        with silent_operation("Log clone_focus_pure failure"):
-            logger.error(f"Failed to clone focus '{getattr(src, 'id', 'N/A')}': {e}")
+        logger.error(f"Failed to clone focus '{getattr(src, 'id', 'N/A')}': {e}")
         # fallback minimal clone
-        with silent_operation("Create minimal focus clone"):
-            return Focus(id=str(src.id), name=str(getattr(src, 'name', '') or ''), x=int(getattr(src, 'x', 0) or 0), y=int(getattr(src, 'y', 0) or 0))
+        return Focus(id=str(src.id), name=str(getattr(src, 'name', '') or ''), x=int(getattr(src, 'x', 0) or 0), y=int(getattr(src, 'y', 0) or 0))
         return Focus(id=str(getattr(src, 'id', 'unknown')))
 
 # endregion
@@ -333,8 +330,7 @@ def obfuscate_path(p: Optional[str]) -> str:
         base = os.path.basename(s)
         return base or '<path>'
     except Exception:
-        with silent_operation("Log obfuscate_path failure"):
-            logger.exception("obfuscate_path failed")
+        logger.exception("obfuscate_path failed")
         return '<path>'
 
 def obfuscate_text(s: str) -> str:
@@ -348,12 +344,11 @@ def obfuscate_text(s: str) -> str:
             return s
         out = str(s)
         # Replace the user's home directory (both separators)
-        with silent_operation("Replace home directory in text"):
-            home = os.path.expanduser('~')
-            if home:
-                # raw and normalized variants
-                out = out.replace(home, '<home>')
-                out = out.replace(home.replace('\\', '/'), '<home>')
+        home = os.path.expanduser('~')
+        if home:
+            # raw and normalized variants
+            out = out.replace(home, '<home>')
+            out = out.replace(home.replace('\\', '/'), '<home>')
         # Collapse Windows absolute paths like C:\something\...\name.ext -> C:\...\name.ext
         def _collapse_windows_path(m: re.Match) -> str:
             full = m.group(0)
@@ -369,8 +364,7 @@ def obfuscate_text(s: str) -> str:
         out = re.sub(r"/(?:[^\s\n\r\t\"']+/)+[^\s\n\r\t\"']+", _collapse_posix_path, out)
         return out
     except Exception:
-        with silent_operation("Log obfuscate_text failure"):
-            logger.exception("obfuscate_text failed")
+        logger.exception("obfuscate_text failed")
         return s
 
 def obfuscate_user_in_path(path: str) -> str:
@@ -400,8 +394,7 @@ def obfuscate_user_in_path(path: str) -> str:
             return os.path.sep.join(parts)
         return path
     except Exception:
-        with silent_operation("Log obfuscate_user_in_path failure"):
-            logger.exception("obfuscate_user_in_path failed")
+        logger.exception("obfuscate_user_in_path failed")
         return path
 
 # endregion
@@ -437,8 +430,19 @@ def draw_outlined_text(painter: QPainter, rect: QRectF, lines: list[str], font: 
             baseline_y = r.top() + (line_h - fm.height()) / 2.0 + fm.ascent()
             if outline_th and outline_th > 0:
                 try:
-                    path = QPainterPath()
-                    path.addText(QPointF(x, baseline_y), painter.font(), ln)
+                    _cache = getattr(draw_outlined_text, '_path_cache', None)
+                    if _cache is None:
+                        _cache = {}
+                        draw_outlined_text._path_cache = _cache
+                    _pkey = (painter.font().key(), ln)
+                    base_path = _cache.get(_pkey)
+                    if base_path is None:
+                        base_path = QPainterPath()
+                        base_path.addText(QPointF(0.0, 0.0), painter.font(), ln)
+                        if len(_cache) > 1024:
+                            _cache.clear()
+                        _cache[_pkey] = base_path
+                    path = base_path.translated(x, baseline_y)
                     pen = QPen(outline_col)
                     pen.setWidth(max(1, int(outline_th) * 2))
                     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)

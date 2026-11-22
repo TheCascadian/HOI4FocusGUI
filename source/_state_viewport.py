@@ -1089,7 +1089,7 @@ class StateViewportDock(QDockWidget):
         self.tags_btn = QPushButton('Country Tags')
         self.tags_btn.setToolTip('Import a country_tags.txt file to provide TAG suggestions')
         row.addWidget(self.tags_btn)
-    # Dock-local zoom label (shows current view zoom) — attached to this dock's toolbar row
+    # Dock-local zoom label (shows current view zoom) - attached to this dock's toolbar row
         row.addStretch()
         try:
             self.view_zoom_label = QLabel('100%')
@@ -2094,7 +2094,7 @@ class StateViewportDock(QDockWidget):
                     except Exception as e:
                         handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             else:
-                # No spatial index (no bounds) — fall back to scene's bounding rect
+                # No spatial index (no bounds) - fall back to scene's bounding rect
                 try:
                     self.view.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
                 except Exception as e:
@@ -2743,7 +2743,7 @@ class StateViewportDock(QDockWidget):
             list_widget = QListWidget()
             for sid in sorted(multi.keys(), key=lambda x: int(x) if str(x).isdigit() else x):
                 cores = ', '.join(multi[sid])
-                item = QListWidgetItem(f"{sid}: {self._state_meta.get(sid, {}).get('name','')} — cores: {cores}")
+                item = QListWidgetItem(f"{sid}: {self._state_meta.get(sid, {}).get('name','')} - cores: {cores}")
                 item.setData(Qt.ItemDataRole.UserRole, sid)
                 list_widget.addItem(item)
             layout.addWidget(list_widget)

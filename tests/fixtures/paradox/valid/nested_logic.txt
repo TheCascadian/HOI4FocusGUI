@@ -1,0 +1,60 @@
+focus_tree = {
+	id = nested_logic_tree
+
+	focus = {
+		id = logic_root
+		x = 0
+		y = 0
+		cost = 10
+	}
+
+	focus = {
+		id = logic_alt
+		x = 2
+		y = 0
+		cost = 10
+	}
+
+	focus = {
+		id = logic_child
+		x = 1
+		y = 1
+		cost = 10
+
+		prerequisite = {
+			OR = {
+				focus = logic_root
+				focus = logic_alt
+			}
+		}
+
+		available = {
+			OR = {
+				AND = {
+					has_government = fascism
+					has_war_support > 0.3
+				}
+				AND = {
+					has_government = communism
+					NOT = {
+						has_dlc = "Waking the Tiger"
+					}
+				}
+			}
+			NOT = {
+				OR = {
+					has_completed_focus = logic_alt
+					has_country_flag = blocked
+				}
+			}
+		}
+
+		bypass = {
+			has_completed_focus = logic_root
+		}
+
+		visible = {
+			always = yes
+		}
+	}
+}

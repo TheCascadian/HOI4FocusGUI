@@ -43,9 +43,9 @@ def test_save_then_load_project_file_round_trips_via_disk(window, tmp_path):
     fixture_path = FIXTURES_DIR / "prerequisites.json"
     original = json.loads(fixture_path.read_text(encoding="utf-8"))
 
-    # Load fixture into the live window, then use the app's own save path
-    # (_build_project_payload + atomic_write_json, exactly what
-    # save_project() does) to write it back out to a throwaway file.
+    # Load fixture into the live window, then write the payload out in the
+    # flat, schema-version-less dialect older builds produced. Reading it
+    # back therefore also exercises the v0 -> v1 migration on load.
     window.load_project_from_dict(original)
     payload = window._build_project_payload()
     out_file = tmp_path / "roundtrip_project.json"

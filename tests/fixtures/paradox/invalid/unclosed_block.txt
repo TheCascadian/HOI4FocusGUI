@@ -1,0 +1,9 @@
+focus_tree = {
+	id = unclosed_tree
+
+	focus = {
+		id = unclosed_focus
+		x = 0
+		y = 0
+		cost = 10
+}

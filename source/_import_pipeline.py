@@ -1,26 +1,31 @@
 """
-Lightweight import pipeline for lenient parsing, preservation of raw blocks,
-multi-pass resolution (positions, sanitization), deterministic grid de-conflict,
-node/connection creation, simple styling pass, and fit-to-view calculation.
+Import pipeline: parse, preserve raw blocks, resolve positions, de-conflict on a
+grid, build nodes/connections, apply styles, and compute a fit-to-view.
 
-This module is intentionally conservative: unknown blocks are preserved as
-raw_text so nothing is lost during import.
+Parsing itself is delegated to the Paradox parser (``_paradox_cst``) via
+``_txt_converter``; this module does no lexical work of its own. Unknown blocks
+are preserved verbatim as ``raw_text`` so nothing is lost during import.
+
+Structurally invalid input is *not* silently downgraded. A
+``ParadoxSyntaxError`` from strict mode propagates to the caller, and in
+recovering mode every recovery shows up in ``diagnostics['parse_diagnostics']``.
+The generic (non-focus-tree) path is used only when the input parses cleanly but
+contains no focus definitions.
 
 API: create ImportPipeline() and call run(text: str) -> dict with keys:
  - nodes: list of Node
  - connections: list of Connection
  - diagnostics: dict
-
-This file implements the recommendations given in the user prompt.
+ - fit: dict
 """
 
 from __future__ import annotations
 
-import re
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from _paradox_cst import Assignment, Block, Scalar
+from _paradox_cst import parse as parse_paradox
 from _txt_converter import TxtFocusParser
 
 
@@ -80,22 +85,24 @@ class ImportPipeline:
 		self.max_search_radius = max_search_radius
 		# cache last successful parse mode for diagnostics/telemetry
 		self._last_parse_mode: Optional[str] = None
+		# structured diagnostics from the most recent run()
+		self._last_diagnostics: List[Dict[str, Any]] = []
 
-	def _run_focus_tree_parser(self, text: str) -> Optional[Dict[str, Any]]:
-		"""Attempt to parse an HOI4 focus tree via TxtFocusParser.
+	def _run_focus_tree_parser(
+		self, text: str, filename: str = '<string>', recover: bool = True
+	) -> Optional[Dict[str, Any]]:
+		"""Parse an HOI4 focus tree via TxtFocusParser.
 
-		Returns the standard run() payload on success, or None when the input
-		does not look like a focus tree (fallback to lenient parser).
+		Returns the standard run() payload, or None when the input parsed but
+		defines no focuses -- the one case where falling through to the generic
+		path is meaningful. Syntax errors are never swallowed: in strict mode
+		they raise, and in recovering mode they are carried in the payload's
+		``diagnostics['parse_diagnostics']``.
 		"""
-		try:
-			parser = TxtFocusParser(text)
-		except Exception:
-			return None
-
-		try:
-			parsed = parser.parse()
-		except Exception:
-			return None
+		parser = TxtFocusParser(text, filename=filename, recover=recover)
+		parsed = parser.parse()
+		parse_diagnostics: List[Dict[str, Any]] = list(parsed.get('diagnostics') or [])
+		self._last_diagnostics = parse_diagnostics
 
 		focuses: List[Dict[str, Any]] = list(parsed.get('focuses', []) or [])
 		if not focuses:
@@ -200,6 +207,7 @@ class ImportPipeline:
 			'import_mode': 'hoi4_txt_parser',
 			'tree': parsed.get('tree_info', {}),
 			'mutex_pairs': mutex_pairs,
+			'parse_diagnostics': parse_diagnostics,
 		}
 
 		self._last_parse_mode = 'hoi4_txt_parser'
@@ -210,46 +218,34 @@ class ImportPipeline:
 			'fit': fit,
 		}
 
-	# ---------- Pass 1: Lenient parse (brace counting + regex key:value) ----------
-	def parse_lenient(self, text: str) -> List[ParsedNode]:
+	# ---------- Pass 1: Generic parse of any Paradox-shaped document ----------
+	def parse_lenient(
+		self, text: str, filename: str = '<string>', recover: bool = True
+	) -> List[ParsedNode]:
+		"""Turn any Paradox document into flat ParsedNodes, keeping raw text.
+
+		Used for input that parses but is not a focus tree. Each top-level
+		``name = { ... }`` becomes one node whose attrs are every scalar
+		assignment beneath it; top-level bare values are kept as raw-only nodes
+		so nothing is dropped.
+		"""
+		document = parse_paradox(text, filename=filename, recover=recover)
+		self._last_diagnostics = [d.to_dict() for d in document.diagnostics]
+
 		nodes: List[ParsedNode] = []
-		i = 0
-		n = len(text)
-		# accept patterns like 'name {', or 'name = {', etc.
-		block_re = re.compile(r"(\w+)\s*(?:=\s*)?\{")
-		while i < n:
-			m = block_re.search(text, i)
-			if not m:
-				remainder = text[i:].strip()
-				if remainder:
-					nodes.append(ParsedNode(None, None, {}, {}, remainder))
-				break
-			name = m.group(1)
-			start = m.end()
-			# brace counting
-			brace = 1
-			j = start
-			while j < n and brace > 0:
-				if text[j] == '{':
-					brace += 1
-				elif text[j] == '}':
-					brace -= 1
-				j += 1
-			block = text[m.start():j]
-			# extract simple key = value pairs
-			attrs: Dict[str, Any] = {}
-			for kv in re.findall(r"(\w+)\s*=\s*(\"[^\"]*\"|[^,\n}\s]+)", block):
-				k, v = kv
-				v = v.strip()
-				if v.startswith('"') and v.endswith('"'):
-					v = v[1:-1]
-				attrs[k] = v
-			id_ = attrs.get('id') or attrs.get('name') or f"{name}_{len(nodes)}"
-			parent = attrs.get('parent')
-			raw_pos = {'x': attrs.get('x'), 'y': attrs.get('y')}
-			parsed = ParsedNode(id_, parent, raw_pos, attrs, block)
-			nodes.append(parsed)
-			i = j
+		for child in document.children:
+			if isinstance(child, Assignment) and isinstance(child.value, Block):
+				attrs: Dict[str, Any] = {}
+				for descendant in child.value.walk():
+					if isinstance(descendant, Assignment) and isinstance(descendant.value, Scalar):
+						attrs[descendant.key.value] = descendant.value.value
+				id_ = attrs.get('id') or attrs.get('name') or f"{child.key.value}_{len(nodes)}"
+				raw_pos = {'x': attrs.get('x'), 'y': attrs.get('y')}
+				nodes.append(
+					ParsedNode(id_, attrs.get('parent'), raw_pos, attrs, child.text)
+				)
+			else:
+				nodes.append(ParsedNode(None, None, {}, {}, document.text_of(child)))
 		return nodes
 
 	# ---------- Pass 2: Resolve positions and sanitize ----------
@@ -428,13 +424,21 @@ class ImportPipeline:
 		return {'center': center, 'scale': scale, 'bbox': bbox}
 
 	# ---------- Run full pipeline ----------
-	def run(self, text: str) -> Dict[str, Any]:
-		# Prefer the focus-tree aware parser when it recognizes the input.
-		focus_payload = self._run_focus_tree_parser(text)
+	def run(
+		self, text: str, filename: str = '<string>', recover: bool = True
+	) -> Dict[str, Any]:
+		"""Parse and lay out ``text``.
+
+		Raises ``ParadoxSyntaxError`` when ``recover`` is False and the input is
+		structurally invalid; otherwise recoveries are reported under
+		``diagnostics['parse_diagnostics']``.
+		"""
+		# Prefer the focus-tree aware parser when the input defines focuses.
+		focus_payload = self._run_focus_tree_parser(text, filename=filename, recover=recover)
 		if focus_payload is not None:
 			return focus_payload
 		self._last_parse_mode = 'lenient'
-		parsed = self.parse_lenient(text)
+		parsed = self.parse_lenient(text, filename=filename, recover=recover)
 		self.resolve_positions(parsed)
 		nodes, connections = self.build_nodes_and_connections(parsed)
 		moves = self.deconflict_grid(nodes)
@@ -446,6 +450,8 @@ class ImportPipeline:
 			'nodes_moved': moves,
 			'unresolved': [p.id for p in parsed if p.id and (p.abs_x is None or p.abs_y is None)],
 			'parsed_audits': {p.id: p.audit for p in parsed if p.id},
+			'import_mode': 'lenient',
+			'parse_diagnostics': list(self._last_diagnostics),
 		}
 		return {'nodes': nodes, 'connections': connections, 'diagnostics': diagnostics, 'fit': fit}
 

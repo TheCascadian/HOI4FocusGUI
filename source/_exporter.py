@@ -1,27 +1,101 @@
 # _exporter.py
 """
 HOI4 Focus Tree Exporter
-Converts FocusTree dataclass instances back to .txt format
-Also exports HOI4 state files from edited state metadata
+Converts FocusTree dataclass instances back to .txt format via the
+structured Paradox writer (:mod:`_paradox_writer`), with validated,
+path-safe, atomic output. Also exports HOI4 state files from edited state
+metadata.
 """
 
 import logging
 import os
 import re
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from _dataStructs import Focus, FocusBranch, FocusTree
+from _dataStructs import Focus, FocusTree
+from _export_validation import (
+    ExportReport,
+    ExportValidationError,
+    PathTraversalError,
+    resolve_within,
+    validate_filename,
+    validate_focus_id,
+    validate_icon_name,
+    validate_localization_key,
+)
+from _paradox_writer import (
+    Assign,
+    BlankLine,
+    Bool,
+    Node,
+    atom,
+    block,
+    escape_paradox_string,
+    inline_block,
+    raw_lines_block,
+    render,
+    value_node,
+)
+
+
+def _blank() -> BlankLine:
+    return BlankLine()
+
+
+class ExportError(Exception):
+    """A structural export failure that identifies the affected focus or file.
+
+    Raised for problems that are not simple field-validation failures (those
+    go into :class:`~_export_validation.ExportReport` instead) -- e.g. an I/O
+    failure while writing a specific file.
+    """
+
+    def __init__(self, message: str, *, focus_id: Optional[str] = None, file: Optional[str] = None):
+        self.focus_id = focus_id
+        self.file = file
+        located = message
+        if focus_id:
+            located = f"focus {focus_id!r}: {located}"
+        if file:
+            located = f"{located} ({file})"
+        super().__init__(located)
+
+
+def _atomic_write(path: str, content: str, *, encoding: str) -> None:
+    """Write ``content`` to ``path`` through a temp file + atomic replace.
+
+    The temp file lives in the same directory as the target so the final
+    ``os.replace`` is a same-filesystem rename (and therefore atomic); a
+    failure partway through writing never leaves a truncated or partial file
+    at ``path``.
+    """
+
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".export_tmp_", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 # region Focus Tree Exporter
 
 class HOI4Exporter:
-    """Exporter for HOI4 focus trees"""
+    """Exporter for HOI4 focus trees."""
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.indent = "\t"
         self.last_export_summary: Optional[Dict[str, Any]] = None
+        self.last_export_report: Optional[ExportReport] = None
 
     def export_tree(
         self,
@@ -44,86 +118,161 @@ class HOI4Exporter:
     ) -> bool:
         """Export ``tree`` to disk.
 
-        Args:
-            tree: Focus tree payload to export.
-            destination: When ``project_name`` is provided, treated as the base directory
-                that will contain per-project subfolders. Otherwise interpreted as either
-                a directory (export file written inside) or a concrete file path.
-            project_name: Optional mod/project identifier. When set, the exporter creates
-                ``<destination>/<project_slug>/common/national_focus`` (or the project root
-                directly when ``use_mod_structure`` is False) before writing the focus file.
-            focus_filename: Optional filename override for the focus script. ``.txt`` is
-                appended automatically when missing.
-            ensure_unique: When True, append a numeric suffix if the target file already
-                exists. The summary exposes whether a rename occurred.
-            use_mod_structure: When True (default) and ``project_name`` is provided, create
-                the HOI4 mod directory layout ``common/national_focus`` inside the project
-                folder.
-            encoding: File encoding used for the exported focus script.
+        Returns ``True`` if the export completed with no validation
+        failures. Full detail -- generated files, warnings, validation
+        failures, copied/skipped assets -- is available afterwards via
+        :meth:`get_last_export_report`; ``get_last_export_summary`` remains
+        available for callers that only need the resolved paths.
 
-        Returns:
-            ``True`` on success, ``False`` otherwise. Additional details about the export are
-            stored on ``self.last_export_summary``.
+        Programming errors (bad arguments, I/O failures that are not simple
+        validation problems) raise rather than being swallowed into a bare
+        ``False``: callers that want a report-only interface should use
+        :meth:`export`.
         """
 
         self.last_export_summary = None
+        report, focus_path, summary = self.export(
+            tree,
+            destination,
+            project_name=project_name,
+            focus_filename=focus_filename,
+            ensure_unique=ensure_unique,
+            use_mod_structure=use_mod_structure,
+            encoding=encoding,
+            write_localisation=write_localisation,
+            localisation_language=localisation_language,
+            localisation_languages=localisation_languages,
+            localisation_filename=localisation_filename,
+            write_gfx=write_gfx,
+            gfx_filename=gfx_filename,
+            icon_source_dirs=icon_source_dirs,
+        )
+        self.last_export_summary = summary
+        self.last_export_report = report
+        return report.success
+
+    def export(
+        self,
+        tree: FocusTree,
+        destination: str,
+        *,
+        project_name: Optional[str] = None,
+        focus_filename: Optional[str] = None,
+        ensure_unique: bool = False,
+        use_mod_structure: bool = True,
+        encoding: str = 'utf-8-sig',
+        write_localisation: bool = True,
+        localisation_language: str = 'english',
+        localisation_languages: Optional[List[str]] = None,
+        localisation_filename: Optional[str] = None,
+        write_gfx: bool = True,
+        gfx_filename: Optional[str] = None,
+        icon_source_dirs: Optional[List[str]] = None,
+    ) -> Tuple[ExportReport, Optional[str], Dict[str, Any]]:
+        """Validate and export ``tree``, returning ``(report, focus_path, summary)``.
+
+        Validation failures on the tree id or a focus id are collected into
+        the report and abort the write (an export must never emit a script
+        that references or defines an unusable identifier). I/O and
+        structural problems raise :class:`ExportError` naming the affected
+        focus or file, rather than being caught and turned into ``False``.
+        """
+
+        report = ExportReport()
+
         try:
-            focus_path, summary = self._resolve_focus_export_path(
-                tree=tree,
-                destination=destination,
-                project_name=project_name,
-                focus_filename=focus_filename,
-                ensure_unique=ensure_unique,
-                use_mod_structure=use_mod_structure,
-            )
-            content = self.tree_to_string(tree)
-            with open(focus_path, 'w', encoding=encoding) as f:
-                f.write(content)
-            summary['encoding'] = encoding
+            validate_focus_id(tree.id, field_name="focus_tree.id")
+        except ExportValidationError as exc:
+            report.add_failure(str(exc))
+            return report, None, {}
 
-            # Optional: write localisation and gfx/icon assets when we have a project root
-            project_root = summary.get('project_root')
-            project_slug = summary.get('project_slug') or self._slugify(getattr(tree, 'tree_name', None) or getattr(tree, 'id', None) or 'focus_project', 'focus_project')
-            icon_source_dirs = icon_source_dirs or []
+        seen_ids: Dict[str, int] = {}
+        for focus in tree.focuses:
+            try:
+                validate_focus_id(focus.id, field_name=f"focus.id")
+            except ExportValidationError as exc:
+                report.add_failure(str(exc))
+                continue
+            seen_ids[focus.id] = seen_ids.get(focus.id, 0) + 1
+        for fid, count in seen_ids.items():
+            if count > 1:
+                report.add_warning(f"focus id {fid!r} is used by {count} focuses")
 
-            if project_root and write_localisation:
-                langs: List[str] = list(localisation_languages or [localisation_language])
-                loc_paths: Dict[str, str] = {}
-                for lang in langs:
-                    loc_path = self._write_localisation(
-                        tree,
-                        project_root,
-                        language=lang,
-                        filename_override=localisation_filename,
-                    )
-                    loc_paths[lang] = loc_path
+        if not report.success:
+            return report, None, {}
 
-                # Back-compat: if single language, expose 'localisation_path'; always include map
-                if len(loc_paths) == 1:
-                    summary['localisation_path'] = next(iter(loc_paths.values()))
-                summary['localisation_paths'] = loc_paths
-                summary['localisation_languages'] = list(loc_paths.keys())
+        focus_path, summary = self._resolve_focus_export_path(
+            tree=tree,
+            destination=destination,
+            project_name=project_name,
+            focus_filename=focus_filename,
+            ensure_unique=ensure_unique,
+            use_mod_structure=use_mod_structure,
+            report=report,
+        )
+        if focus_path is None:
+            return report, None, summary
 
-            if project_root and write_gfx:
-                gfx_info = self._write_gfx_and_copy_icons(
+        content = self.tree_to_string(tree)
+        try:
+            _atomic_write(focus_path, content, encoding=encoding)
+        except OSError as exc:
+            raise ExportError(f"failed to write focus script: {exc}", file=focus_path) from exc
+        report.focus_path = focus_path
+        report.add_generated_file(focus_path)
+        summary['encoding'] = encoding
+
+        project_root = summary.get('project_root')
+        project_slug = summary.get('project_slug') or self._slugify(
+            getattr(tree, 'tree_name', None) or getattr(tree, 'id', None) or 'focus_project', 'focus_project'
+        )
+        icon_source_dirs = icon_source_dirs or []
+
+        if project_root and write_localisation:
+            langs: List[str] = list(localisation_languages or [localisation_language])
+            loc_paths: Dict[str, str] = {}
+            for lang in langs:
+                loc_path = self._write_localisation(
                     tree,
                     project_root,
-                    project_slug=project_slug,
-                    filename_override=gfx_filename,
-                    icon_source_dirs=icon_source_dirs,
+                    language=lang,
+                    filename_override=localisation_filename,
+                    report=report,
                 )
-                summary.update(gfx_info)
+                loc_paths[lang] = loc_path
+                report.add_generated_file(loc_path)
 
-            self.last_export_summary = summary
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to export tree: {e}")
-            self.last_export_summary = None
-            return False
+            if len(loc_paths) == 1:
+                summary['localisation_path'] = next(iter(loc_paths.values()))
+            summary['localisation_paths'] = loc_paths
+            summary['localisation_languages'] = list(loc_paths.keys())
+            report.localisation_paths = loc_paths
+
+        if project_root and write_gfx:
+            gfx_info = self._write_gfx_and_copy_icons(
+                tree,
+                project_root,
+                project_slug=project_slug,
+                filename_override=gfx_filename,
+                icon_source_dirs=icon_source_dirs,
+                report=report,
+            )
+            summary.update(gfx_info)
+            report.gfx_path = gfx_info.get('gfx_path')
+            if report.gfx_path:
+                report.add_generated_file(report.gfx_path)
+            report.copied_assets.extend(gfx_info.get('icons_copied', []))
+            report.skipped_assets.extend(gfx_info.get('icons_missing', []))
+
+        return report, focus_path, summary
 
     def get_last_export_summary(self) -> Optional[Dict[str, Any]]:
         """Return metadata from the most recent export operation."""
         return self.last_export_summary
+
+    def get_last_export_report(self) -> Optional[ExportReport]:
+        """Return the structured :class:`ExportReport` from the last export."""
+        return self.last_export_report
 
     def _resolve_focus_export_path(
         self,
@@ -133,46 +282,60 @@ class HOI4Exporter:
         focus_filename: Optional[str],
         ensure_unique: bool,
         use_mod_structure: bool,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """Determine the concrete file path for the focus export."""
+        report: ExportReport,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Determine the concrete file path for the focus export.
+
+        Every directory join goes through :func:`resolve_within`, so a
+        crafted ``project_name``/``focus_filename`` (``../../etc``) cannot
+        escape the destination directory.
+        """
 
         if not destination:
-            raise ValueError("destination path must be provided")
+            report.add_failure("destination path must be provided")
+            return None, {}
 
-        filename = self._normalize_focus_filename(focus_filename, tree)
+        try:
+            filename = self._normalize_focus_filename(focus_filename, tree)
+        except ExportValidationError as exc:
+            report.add_failure(str(exc))
+            return None, {}
+
         fallback_slug = tree.tree_name or tree.id or "focus_project"
         project_slug: Optional[str] = None
 
-        if project_name:
-            base_dir = destination or os.getcwd()
-            if os.path.splitext(base_dir)[1] and not os.path.isdir(base_dir):
-                base_dir = os.path.dirname(base_dir)
-            if not base_dir:
-                base_dir = os.getcwd()
-            base_dir = os.path.abspath(base_dir)
-            project_slug = self._slugify(project_name, fallback_slug)
-            project_root = os.path.join(base_dir, project_slug)
-            project_root = os.path.abspath(project_root)
-            if use_mod_structure:
-                focus_dir = os.path.join(project_root, 'common', 'national_focus')
-            else:
-                focus_dir = project_root
-            focus_dir = os.path.abspath(focus_dir)
-            os.makedirs(focus_dir, exist_ok=True)
-            requested_path = os.path.join(focus_dir, filename)
-        else:
-            destination = destination or os.getcwd()
-            abs_dest = os.path.abspath(destination)
-            if os.path.isdir(abs_dest) or (not os.path.exists(abs_dest) and not os.path.splitext(abs_dest)[1]):
-                focus_dir = abs_dest
+        try:
+            if project_name:
+                base_dir = destination or os.getcwd()
+                if os.path.splitext(base_dir)[1] and not os.path.isdir(base_dir):
+                    base_dir = os.path.dirname(base_dir)
+                if not base_dir:
+                    base_dir = os.getcwd()
+                base_dir = os.path.abspath(base_dir)
+                project_slug = self._slugify(project_name, fallback_slug)
+                project_root = resolve_within(base_dir, project_slug, field_name="project_root")
+                if use_mod_structure:
+                    focus_dir = resolve_within(project_root, 'common', 'national_focus', field_name="focus_dir")
+                else:
+                    focus_dir = project_root
                 os.makedirs(focus_dir, exist_ok=True)
-                requested_path = os.path.join(focus_dir, filename)
+                requested_path = resolve_within(focus_dir, filename, field_name="focus_path")
             else:
-                focus_dir = os.path.dirname(abs_dest) or os.getcwd()
-                focus_dir = os.path.abspath(focus_dir)
-                os.makedirs(focus_dir, exist_ok=True)
-                requested_path = abs_dest
-            project_root = focus_dir
+                destination = destination or os.getcwd()
+                abs_dest = os.path.abspath(destination)
+                if os.path.isdir(abs_dest) or (not os.path.exists(abs_dest) and not os.path.splitext(abs_dest)[1]):
+                    focus_dir = abs_dest
+                    os.makedirs(focus_dir, exist_ok=True)
+                    requested_path = resolve_within(focus_dir, filename, field_name="focus_path")
+                else:
+                    focus_dir = os.path.dirname(abs_dest) or os.getcwd()
+                    focus_dir = os.path.abspath(focus_dir)
+                    os.makedirs(focus_dir, exist_ok=True)
+                    requested_path = abs_dest
+                project_root = focus_dir
+        except PathTraversalError as exc:
+            report.add_failure(str(exc))
+            return None, {}
 
         requested_path = os.path.abspath(requested_path)
         project_root = os.path.abspath(project_root)
@@ -207,7 +370,8 @@ class HOI4Exporter:
         stem = self._slugify(stem, base_default)
         if not ext.startswith('.'):
             ext = f'.{ext}'
-        return f"{stem}{ext}"
+        filename = f"{stem}{ext}"
+        return validate_filename(filename, field_name="focus_filename")
 
     def _slugify(self, value: str, fallback: str) -> str:
         """Sanitize ``value`` for safe directory/file names."""
@@ -234,237 +398,189 @@ class HOI4Exporter:
                 return candidate
             counter += 1
 
+    # -------------------------
+    # Script tree construction
+    # -------------------------
     def tree_to_string(self, tree: FocusTree) -> str:
-        """Convert FocusTree to HOI4 script string"""
-        lines = []
+        """Convert a FocusTree to deterministic HOI4 script text."""
+        return render(self._tree_nodes(tree), indent=self.indent)
 
-        # Export search filter priorities if present
+    def _tree_nodes(self, tree: FocusTree) -> List[Node]:
+        nodes: List[Node] = []
+
         if tree.search_filter_priorities:
-            lines.append("search_filter_prios = {")
-            for key, value in tree.search_filter_priorities.items():
-                lines.append(f"{self.indent}{key} = {value}")
-            lines.append("}")
-            lines.append("")
+            nodes.append(Assign('search_filter_prios', block([
+                Assign(str(key), value_node(value)) for key, value in tree.search_filter_priorities.items()
+            ])))
+            nodes.append(_blank())
 
-        # Start focus_tree block
-        lines.append("focus_tree = {")
-        lines.append(f"{self.indent}id = {tree.id}")
-        lines.append("")
+        focus_tree_children: List[Node] = []
+        focus_tree_children.append(Assign('id', atom(tree.id)))
+        focus_tree_children.append(_blank())
 
-        # Country block
-        lines.append(f"{self.indent}country = {{")
-        lines.append(f"{self.indent}{self.indent}factor = {tree.country_factor}")
-        lines.append(f"{self.indent}}}")
-        lines.append("")
+        focus_tree_children.append(Assign('country', block([
+            Assign('factor', value_node(tree.country_factor)),
+        ])))
+        focus_tree_children.append(_blank())
 
-        # Tree properties
         if tree.is_default:
-            lines.append(f"{self.indent}default = yes")
-        lines.append(f"{self.indent}reset_on_civilwar = {'yes' if tree.reset_on_civilwar else 'no'}")
-        lines.append("")
+            focus_tree_children.append(Assign('default', Bool(True)))
+        focus_tree_children.append(Assign('reset_on_civilwar', Bool(bool(tree.reset_on_civilwar))))
+        focus_tree_children.append(_blank())
 
-        # Initial show position
         if tree.initial_show_position:
-            lines.append(f"{self.indent}initial_show_position = {{")
-            lines.append(f"{self.indent}{self.indent}focus = {tree.initial_show_position}")
-            lines.append(f"{self.indent}}}")
-            lines.append("")
+            focus_tree_children.append(Assign('initial_show_position', block([
+                Assign('focus', atom(tree.initial_show_position)),
+            ])))
+            focus_tree_children.append(_blank())
 
-        # Shared focuses
         for shared in tree.shared_focuses:
-            lines.append(f"{self.indent}shared_focus = {shared}")
+            focus_tree_children.append(Assign('shared_focus', atom(shared)))
         if tree.shared_focuses:
-            lines.append("")
+            focus_tree_children.append(_blank())
 
-        # Export all focuses
         for focus in tree.focuses:
-            focus_lines = self._export_focus(focus, depth=1)
-            lines.extend(focus_lines)
-            lines.append("")
+            focus_tree_children.append(self._focus_node(focus))
+            focus_tree_children.append(_blank())
 
-        lines.append("}")
+        nodes.append(Assign('focus_tree', block(focus_tree_children)))
+        return nodes
 
-        return '\n'.join(lines)
-
-    def _export_focus(self, focus: Focus, depth: int = 0) -> List[str]:
-        """Export a single focus to script lines"""
-        lines = []
-        ind = self.indent * depth
-
-        lines.append(f"{ind}focus = {{")
-
-        # Basic properties
-        lines.append(f"{ind}{self.indent}id = {focus.id}")
+    def _focus_node(self, focus: Focus) -> Assign:
+        children: List[Node] = []
+        children.append(Assign('id', atom(focus.id)))
         if focus.icon:
-            lines.append(f"{ind}{self.indent}icon = {focus.icon}")
+            children.append(Assign('icon', atom(focus.icon)))
 
-        # Position
         relative_pos = getattr(focus, 'relative_position_id', None)
+        children.append(Assign('x', value_node(focus.x)))
+        children.append(Assign('y', value_node(focus.y)))
         if relative_pos:
-            lines.append(f"{ind}{self.indent}x = {focus.x}")
-            lines.append(f"{ind}{self.indent}y = {focus.y}")
-            lines.append(f"{ind}{self.indent}relative_position_id = {relative_pos}")
-        else:
-            lines.append(f"{ind}{self.indent}x = {focus.x}")
-            lines.append(f"{ind}{self.indent}y = {focus.y}")
+            children.append(Assign('relative_position_id', atom(relative_pos)))
 
-        lines.append(f"{ind}{self.indent}cost = {focus.cost}")
+        children.append(Assign('cost', value_node(focus.cost)))
 
-        # Search filters
         search_filters = getattr(focus, 'search_filters', None)
         if search_filters:
-            lines.append(f"{ind}{self.indent}search_filters = {{ {' '.join(search_filters)} }}")
+            children.append(Assign('search_filters', inline_block([atom(s) for s in search_filters])))
 
-        # Prerequisites (support AND/OR grouped blocks)
         if getattr(focus, 'prerequisites_groups', None):
             for group in focus.prerequisites_groups:
                 gtype = str(group.get('type') or '').upper().strip()
                 items = list(group.get('items') or [])
                 if gtype in ('AND', 'OR'):
-                    lines.append(f"{ind}{self.indent}prerequisite = {{ {gtype} = {{")
-                    for item in items:
-                        lines.append(f"{ind}{self.indent}{self.indent}focus = {item}")
-                    lines.append(f"{ind}{self.indent}}}}}")
+                    inner = block([Assign(gtype, block([
+                        Assign('focus', atom(item)) for item in items
+                    ]))])
+                    children.append(Assign('prerequisite', inner))
                 else:
-                    # Fallback: simple grouped prerequisite without explicit AND/OR
-                    lines.append(f"{ind}{self.indent}prerequisite = {{")
-                    for item in items:
-                        lines.append(f"{ind}{self.indent}{self.indent}focus = {item}")
-                    lines.append(f"{ind}{self.indent}}}")
+                    children.append(Assign('prerequisite', block([
+                        Assign('focus', atom(item)) for item in items
+                    ])))
         elif focus.prerequisites:
             if focus.prerequisites_grouped:
-                lines.append(f"{ind}{self.indent}prerequisite = {{")
-                for prereq in focus.prerequisites:
-                    lines.append(f"{ind}{self.indent}{self.indent}focus = {prereq}")
-                lines.append(f"{ind}{self.indent}}}")
+                children.append(Assign('prerequisite', block([
+                    Assign('focus', atom(prereq)) for prereq in focus.prerequisites
+                ])))
             else:
                 for prereq in focus.prerequisites:
-                    lines.append(f"{ind}{self.indent}prerequisite = {{ focus = {prereq} }}")
+                    children.append(Assign('prerequisite', inline_block([Assign('focus', atom(prereq))])))
 
-        # Mutually exclusive
         for mutex in focus.mutually_exclusive:
-            lines.append(f"{ind}{self.indent}mutually_exclusive = {{ focus = {mutex} }}")
+            children.append(Assign('mutually_exclusive', inline_block([Assign('focus', atom(mutex))])))
 
-        # Branch visibility condition
         if getattr(focus, 'allow_branch', None):
-            lines.append(f"{ind}{self.indent}allow_branch = {{")
-            for line in str(focus.allow_branch).split('\n'):
-                if line.strip():
-                    lines.append(f"{ind}{self.indent}{self.indent}{line}")
-            lines.append(f"{ind}{self.indent}}}")
+            children.append(Assign('allow_branch', raw_lines_block(str(focus.allow_branch), skip_blank=True)))
 
-        # Availability
         if focus.available:
-            lines.append(f"{ind}{self.indent}available = {{")
-            for line in focus.available.split('\n'):
-                lines.append(f"{ind}{self.indent}{self.indent}{line}")
-            lines.append(f"{ind}{self.indent}}}")
+            children.append(Assign('available', raw_lines_block(focus.available)))
 
         available_if_cap = getattr(focus, 'available_if_capitulated', False)
         if available_if_cap:
-            lines.append(f"{ind}{self.indent}available_if_capitulated = yes")
+            children.append(Assign('available_if_capitulated', Bool(True)))
 
-        # Bypass
         if focus.bypass:
-            lines.append(f"{ind}{self.indent}bypass = {{")
-            for line in focus.bypass.split('\n'):
-                lines.append(f"{ind}{self.indent}{self.indent}{line}")
-            lines.append(f"{ind}{self.indent}}}")
+            children.append(Assign('bypass', raw_lines_block(focus.bypass)))
 
-        # Flags
-        cancel_if_invalid = getattr(focus, 'cancel_if_invalid', False)
-        if cancel_if_invalid:
-            lines.append(f"{ind}{self.indent}cancel_if_invalid = yes")
-        continue_if_invalid = getattr(focus, 'continue_if_invalid', False)
-        if continue_if_invalid:
-            lines.append(f"{ind}{self.indent}continue_if_invalid = yes")
+        if getattr(focus, 'cancel_if_invalid', False):
+            children.append(Assign('cancel_if_invalid', Bool(True)))
+        if getattr(focus, 'continue_if_invalid', False):
+            children.append(Assign('continue_if_invalid', Bool(True)))
 
-        # Tooltips
         complete_tooltip = getattr(focus, 'complete_tooltip', None)
         if complete_tooltip:
-            lines.append(f"{ind}{self.indent}complete_tooltip = {{")
-            for line in complete_tooltip.split('\n'):
-                lines.append(f"{ind}{self.indent}{self.indent}{line}")
-            lines.append(f"{ind}{self.indent}}}")
+            children.append(Assign('complete_tooltip', raw_lines_block(complete_tooltip)))
 
-        # Completion reward
         if focus.completion_reward:
-            lines.append(f"{ind}{self.indent}completion_reward = {{")
-            for line in focus.completion_reward.split('\n'):
-                lines.append(f"{ind}{self.indent}{self.indent}{line}")
-            lines.append(f"{ind}{self.indent}}}")
+            children.append(Assign('completion_reward', raw_lines_block(focus.completion_reward)))
 
-        # AI will do
         ai_block = getattr(focus, 'ai_will_do_block', None)
         if ai_block and isinstance(ai_block, dict):
-            lines.append(f"{ind}{self.indent}ai_will_do = {{")
-            self._export_ai_block(ai_block, lines, depth + 2)
-            lines.append(f"{ind}{self.indent}}}")
-        else:
-            # Backward compatibility: some payloads may store dict in ai_will_do
-            if isinstance(getattr(focus, 'ai_will_do', None), dict):
-                lines.append(f"{ind}{self.indent}ai_will_do = {{")
-                self._export_ai_block(getattr(focus, 'ai_will_do'), lines, depth + 2)
-                lines.append(f"{ind}{self.indent}}}")
-            elif getattr(focus, 'ai_will_do', 1) != 1:
-                lines.append(f"{ind}{self.indent}ai_will_do = {focus.ai_will_do}")
+            children.append(Assign('ai_will_do', block(self._ai_block_nodes(ai_block))))
+        elif isinstance(getattr(focus, 'ai_will_do', None), dict):
+            children.append(Assign('ai_will_do', block(self._ai_block_nodes(getattr(focus, 'ai_will_do')))))
+        elif getattr(focus, 'ai_will_do', 1) != 1:
+            children.append(Assign('ai_will_do', value_node(focus.ai_will_do)))
 
-        lines.append(f"{ind}}}")
+        raw_unparsed = getattr(focus, 'raw_unparsed', None) or []
+        for chunk in raw_unparsed:
+            text = str(chunk)
+            if not text.strip():
+                continue
+            children.append(raw_lines_block(text))
 
-        return lines
+        return Assign('focus', block(children))
 
-    def _export_ai_block(self, ai_data: dict, lines: List[str], depth: int):
-        """Recursively export AI will do block"""
-        ind = self.indent * depth
+    def _ai_block_nodes(self, ai_data: dict) -> List[Node]:
+        nodes: List[Node] = []
         for key, value in ai_data.items():
             if isinstance(value, dict):
-                lines.append(f"{ind}{key} = {{")
-                self._export_ai_block(value, lines, depth + 1)
-                lines.append(f"{ind}}}")
+                nodes.append(Assign(str(key), block(self._ai_block_nodes(value))))
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        lines.append(f"{ind}{key} = {{")
-                        self._export_ai_block(item, lines, depth + 1)
-                        lines.append(f"{ind}}}")
+                        nodes.append(Assign(str(key), block(self._ai_block_nodes(item))))
                     else:
-                        lines.append(f"{ind}{key} = {self._format_value(item)}")
+                        nodes.append(Assign(str(key), value_node(item)))
             else:
-                lines.append(f"{ind}{key} = {self._format_value(value)}")
-
-    def _format_value(self, value: Any) -> str:
-        """Format value for export"""
-        if isinstance(value, bool):
-            return 'yes' if value else 'no'
-        elif isinstance(value, str) and ' ' in value:
-            return f'"{value}"'
-        return str(value)
+                nodes.append(Assign(str(key), value_node(value)))
+        return nodes
 
     # -------------------------
     # Localisation writer
     # -------------------------
-    def _write_localisation(self, tree: FocusTree, project_root: str, *, language: str = 'english', filename_override: Optional[str] = None) -> str:
-        loc_dir = os.path.join(project_root, 'localisation', language)
+    def _write_localisation(
+        self,
+        tree: FocusTree,
+        project_root: str,
+        *,
+        language: str = 'english',
+        filename_override: Optional[str] = None,
+        report: ExportReport,
+    ) -> str:
+        loc_dir = resolve_within(project_root, 'localisation', language, field_name="localisation_dir")
         os.makedirs(loc_dir, exist_ok=True)
 
         stem = filename_override or (getattr(tree, 'tree_name', None) or getattr(tree, 'id', None) or 'focus_tree')
         stem = self._slugify(stem, 'focus_tree')
-        loc_path = os.path.join(loc_dir, f"{stem}_focus_l_{language}.yml")
+        loc_filename = validate_filename(f"{stem}_focus_l_{language}.yml", field_name="localisation_filename")
+        loc_path = resolve_within(loc_dir, loc_filename, field_name="localisation_path")
 
-        lines = []
-        lines.append(f"l_{language}:")
+        lines = [f"l_{language}:"]
         for f in getattr(tree, 'focuses', []) or []:
+            try:
+                validate_localization_key(f.id, field_name="localization key")
+            except ExportValidationError as exc:
+                report.add_warning(f"skipped localisation for {str(exc)}")
+                continue
             name = getattr(f, 'name', '') or f.id
             desc = getattr(f, 'description', '') or ''
-            # Paradox expects :0 suffix in many localisations; keep for compatibility
-            lines.append(f"  {f.id}:0 \"{name}\"")
+            lines.append(f'  {f.id}:0 "{escape_paradox_string(str(name))}"')
             if desc:
-                lines.append(f"  {f.id}_desc:0 \"{desc}\"")
+                lines.append(f'  {f.id}_desc:0 "{escape_paradox_string(str(desc))}"')
 
         content = '\n'.join(lines) + '\n'
-        # UTF-8 with BOM recommended for localisation
-        with open(loc_path, 'w', encoding='utf-8-sig') as f:
-            f.write(content)
+        _atomic_write(loc_path, content, encoding='utf-8-sig')
         return loc_path
 
     # -------------------------
@@ -478,22 +594,26 @@ class HOI4Exporter:
         project_slug: str,
         filename_override: Optional[str],
         icon_source_dirs: List[str],
+        report: ExportReport,
     ) -> Dict[str, Any]:
-        import shutil
-
-        gfx_dir = os.path.join(project_root, 'gfx', 'interface', 'goals')
+        gfx_dir = resolve_within(project_root, 'gfx', 'interface', 'goals', field_name="gfx_dir")
         os.makedirs(gfx_dir, exist_ok=True)
 
         stem = filename_override or f"{project_slug}_goals"
         stem = self._slugify(stem, f"{project_slug}_goals")
-        gfx_path = os.path.join(gfx_dir, f"{stem}.gfx")
+        gfx_filename = validate_filename(f"{stem}.gfx", field_name="gfx_filename")
+        gfx_path = resolve_within(gfx_dir, gfx_filename, field_name="gfx_path")
 
-        # Collect icons used by focuses
         focuses = getattr(tree, 'focuses', []) or []
         icon_map: Dict[str, Dict[str, Any]] = {}
         for f in focuses:
             icon_ref = getattr(f, 'icon', None)
             if not icon_ref:
+                continue
+            try:
+                validate_icon_name(str(icon_ref), field_name=f"focus {f.id} icon")
+            except ExportValidationError as exc:
+                report.add_warning(str(exc))
                 continue
             sprite_name, src_path, basename = self._resolve_icon_sprite_name_and_source(icon_ref, project_slug, icon_source_dirs)
             icon_map[sprite_name] = {
@@ -501,33 +621,32 @@ class HOI4Exporter:
                 'basename': basename,
             }
 
-        # Write .gfx entries
-        gfx_lines = []
+        gfx_nodes: List[Node] = []
         for sprite_name, meta in sorted(icon_map.items()):
             texture_file = meta['basename'] or os.path.basename(meta['src'] or '')
-            if texture_file:
-                texture_rel = f"gfx/interface/goals/{texture_file}"
-            else:
-                # Fallback: keep a placeholder to avoid invalid file reference
-                texture_rel = f"gfx/interface/goals/{sprite_name}.png"
-            gfx_lines.append(f"spriteType = {{ name = \"{sprite_name}\" texturefile = \"{texture_rel}\" }}")
+            texture_rel = f"gfx/interface/goals/{texture_file}" if texture_file else f"gfx/interface/goals/{sprite_name}.png"
+            gfx_nodes.append(Assign('spriteType', inline_block([
+                Assign('name', atom(sprite_name)),
+                Assign('texturefile', atom(texture_rel)),
+            ])))
 
-        with open(gfx_path, 'w', encoding='utf-8-sig') as f:
-            f.write('\n'.join(gfx_lines) + '\n')
+        gfx_content = render(gfx_nodes, indent=self.indent) if gfx_nodes else ''
+        _atomic_write(gfx_path, gfx_content, encoding='utf-8-sig')
 
-        # Copy icon files to gfx dir
         copied: List[str] = []
         missing: List[str] = []
         for sprite_name, meta in icon_map.items():
             src = meta['src']
             if src and os.path.exists(src):
                 try:
-                    dst = os.path.join(gfx_dir, meta['basename'] or os.path.basename(src))
+                    dst_name = meta['basename'] or os.path.basename(src)
+                    dst = resolve_within(gfx_dir, dst_name, field_name="icon_destination")
                     if os.path.normcase(os.path.abspath(src)) != os.path.normcase(os.path.abspath(dst)):
                         shutil.copy2(src, dst)
                     copied.append(dst)
-                except Exception:
-                    self.logger.exception(f"Failed to copy icon '{src}' -> '{gfx_dir}'")
+                except (OSError, PathTraversalError) as exc:
+                    self.logger.warning(f"Failed to copy icon '{src}' -> '{gfx_dir}': {exc}")
+                    report.add_warning(f"failed to copy icon {sprite_name!r}: {exc}")
                     missing.append(sprite_name)
             else:
                 missing.append(sprite_name)
@@ -546,33 +665,26 @@ class HOI4Exporter:
         Otherwise we fabricate a sprite name 'GFX_<project>_<basename>'.
         """
         icon_ref = str(icon_ref).strip()
-        # If it's already a GFX sprite, try to deduce a file name
         if icon_ref.upper().startswith('GFX_'):
             sprite_name = icon_ref
             basename = None
-            # Try to guess a file with same tail if path-like
-            # No reliable way—leave basename None and let .gfx use sprite_name placeholder
         else:
-            # Treat as path or bare filename
             base = os.path.basename(icon_ref)
             name, ext = os.path.splitext(base)
             sprite_name = f"GFX_{project_slug}_{self._slugify(name, name)}"
             basename = base if base else None
 
-        # Resolve source path if basename available or icon_ref is an absolute path
         source_path: Optional[str] = None
         if os.path.isabs(icon_ref) and os.path.exists(icon_ref):
             source_path = icon_ref
             if not basename:
                 basename = os.path.basename(icon_ref)
         elif basename:
-            # Search provided icon source dirs
             for d in icon_source_dirs:
                 candidate = os.path.join(d, basename)
                 if os.path.exists(candidate):
                     source_path = candidate
                     break
-            # Fallback: current working directory
             if not source_path:
                 candidate = os.path.join(os.getcwd(), basename)
                 if os.path.exists(candidate):
@@ -604,12 +716,11 @@ class HOI4StateExporter:
         """
         try:
             content = self.state_to_string(state_id, state_meta)
-            with open(filepath, 'w', encoding='utf-8-sig') as f:
-                f.write(content)
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to export state {state_id}: {e}")
+        except (TypeError, ValueError) as e:
+            self.logger.error(f"Failed to build state {state_id}: {e}")
             return False
+        _atomic_write(filepath, content, encoding='utf-8-sig')
+        return True
 
     def export_states_batch(self, states: dict[str, dict], output_dir: str) -> tuple[int, int]:
         """Export multiple states to individual .txt files
@@ -644,7 +755,7 @@ class HOI4StateExporter:
 
         # Name
         name = state_meta.get('name', f'STATE_{state_id}')
-        lines.append(f"{self.indent}name = \"{name}\"")
+        lines.append(f"{self.indent}name = \"{escape_paradox_string(str(name))}\"")
         lines.append("")
 
         # Manpower

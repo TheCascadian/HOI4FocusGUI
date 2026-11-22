@@ -1,0 +1,5 @@
+focus_tree = {
+	id = stray_operator_tree
+	= yes
+	focus = { id = stray_operator_focus x = 0 y = 0 }
+}

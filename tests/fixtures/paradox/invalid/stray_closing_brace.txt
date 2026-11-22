@@ -1,0 +1,5 @@
+focus_tree = {
+	id = stray_tree
+	focus = { id = stray_focus x = 0 y = 0 cost = 10 }
+}
+}

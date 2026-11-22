@@ -1,0 +1,23 @@
+# Braces in comments must not affect structure: { { { } } }
+# Neither must a lone unbalanced one: }
+focus_tree = {
+	id = comment_tree # trailing comment with a brace }
+
+	focus = {
+		id = comment_focus
+		x = 0
+		y = 0
+		cost = 10
+		# a commented-out block that must stay commented out
+		# available = {
+		#     always = no
+		# }
+		text = "a name with { braces } and a \"quoted\" word"
+		icon = "GFX_with_a_}_in_the_name"
+
+		completion_reward = {
+			custom_effect_tooltip = "closing brace } inside a string"
+			set_variable = { var = brace_count value = 3 }
+		}
+	}
+}

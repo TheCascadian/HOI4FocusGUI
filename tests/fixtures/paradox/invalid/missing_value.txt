@@ -1,0 +1,8 @@
+focus_tree = {
+	id = missing_value_tree
+	focus = {
+		id = missing_value_focus
+		x = 0
+		y =
+	}
+}

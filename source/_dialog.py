@@ -7,6 +7,12 @@ import re
 from typing import Any, Dict, List, Optional
 
 from error_handler import silent_operation
+from _project_document import (
+    new_document,
+    read_summary,
+    save_document,
+    set_editor_preference,
+)
 
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QColor, QFontDatabase, QIcon, QPixmap
@@ -62,8 +68,7 @@ class EditorDialogBase(QDialog):
     """
     def __init__(self, parent: Optional[QWidget] = None, title: Optional[str] = None, modal: bool = True):
         super().__init__(parent)
-        with silent_operation("set_delete_on_close_attr"):
-            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         # --- Start of Patched Block ---
         # Only perform canvas-related updates if a canvas is actually present on the instance.
@@ -79,10 +84,9 @@ class EditorDialogBase(QDialog):
                     canvas.update()
 
                 for conn in list(getattr(canvas, 'connections', []) or []):
-                    with silent_operation("set_connection_prereq_style"):
-                        kind = getattr(conn, 'prereq_kind', None)
-                        if kind and hasattr(conn, 'set_prereq_style'):
-                            conn.set_prereq_style(kind)
+                    kind = getattr(conn, 'prereq_kind', None)
+                    if kind and hasattr(conn, 'set_prereq_style'):
+                        conn.set_prereq_style(kind)
 
                 if hasattr(canvas, 'refresh_connection_colors'):
                     canvas.refresh_connection_colors()
@@ -97,16 +101,13 @@ class EditorDialogBase(QDialog):
         # --- End of Patched Block ---
 
         if title:
-            with silent_operation("set_window_title"):
-                self.setWindowTitle(title)
+            self.setWindowTitle(title)
         if modal:
-            with silent_operation("set_modal"):
-                self.setModal(True)
+            self.setModal(True)
 
     def set_styled_object_name(self, name: str):
         """Set object name for stylesheet scoping safely."""
-        with silent_operation("set_object_name"):
-            self.setObjectName(name)
+        self.setObjectName(name)
 
 
 __all__ = [
@@ -121,7 +122,88 @@ __all__ = [
     "ProjectNoteSettingsDialog",
     "IconLibraryDialog",
     "SettingsDialog",
+    "ProjectRecoveryDialog",
 ]
+
+
+class ProjectRecoveryDialog(EditorDialogBase):
+    """Offered when a project file will not load.
+
+    This is the only Qt-aware part of the persistence story: it renders the
+    plain ``RecoveryCandidate`` records produced by ``_project_document`` and
+    returns the one the user picked. It explains, for each option, where it
+    came from, when it was written, and -- for the file that failed -- which
+    field was wrong.
+    """
+
+    def __init__(self, parent, original_path: str, error, candidates):
+        super().__init__(parent, title="Recover Project")
+        self._candidates = [c for c in candidates if c.valid]
+        self.selected = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"<b>{os.path.basename(original_path)}</b> could not be opened."))
+
+        problem = QTextEdit()
+        problem.setReadOnly(True)
+        problem.setMaximumHeight(110)
+        detail = getattr(error, 'issues', None)
+        if detail:
+            problem.setPlainText(
+                "The file was rejected because:\n"
+                + "\n".join(f"  • {issue}" for issue in detail[:10]))
+        else:
+            problem.setPlainText(str(error))
+        layout.addWidget(problem)
+        path_label = QLabel()
+        set_widget_path_display(path_label, original_path)
+        layout.addWidget(path_label)
+
+        if not self._candidates:
+            layout.addWidget(QLabel(
+                "No autosave or backup of this project could be loaded either.\n"
+                "Your current work has not been changed."))
+        else:
+            layout.addWidget(QLabel(
+                "These recovered copies were checked and load correctly:"))
+            self.list = QListWidget()
+            self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            for candidate in self._candidates:
+                label = {
+                    'autosave': 'Autosave',
+                    'backup': 'Backup',
+                    'original': 'Original',
+                }.get(candidate.kind, candidate.kind.title())
+                focuses = len(candidate.document.focus_tree.get('focuses', []) or []) if candidate.document else 0
+                item = QListWidgetItem(
+                    f"{label} - {candidate.timestamp_text} - "
+                    f"{focuses} focuses - {os.path.basename(candidate.path)}")
+                item.setToolTip(obfuscate_user_in_path(candidate.path))
+                self.list.addItem(item)
+            self.list.setCurrentRow(0)
+            layout.addWidget(self.list)
+
+        buttons = QDialogButtonBox()
+        if self._candidates:
+            recover_btn = buttons.addButton("Recover Selected",
+                                            QDialogButtonBox.ButtonRole.AcceptRole)
+            recover_btn.setDefault(True)
+        buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        if not self._candidates:
+            self.reject()
+            return
+        row = self.list.currentRow()
+        if 0 <= row < len(self._candidates):
+            self.selected = self._candidates[row]
+            self.accept()
+        else:
+            self.reject()
 
 
 class MultiAddDialog(EditorDialogBase):
@@ -132,8 +214,7 @@ class MultiAddDialog(EditorDialogBase):
         # Some callers call dialog.exec() and then read widget values afterward via get_values().
         # The base EditorDialogBase sets WA_DeleteOnClose which can cause C++ widgets to be
         # destroyed on accept(); disable that behaviour for this dialog instance.
-        with silent_operation("disable_delete_on_close"):
-            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.resize(360, 240)
         layout = QFormLayout()
         self.base_id = QLineEdit("focus_")
@@ -235,11 +316,10 @@ class FocusEditDialog(EditorDialogBase):
         self.name_edit = QLineEdit(self.focus.name)
         self.cost_spin = QSpinBox()
         self.cost_spin.setRange(1, 365)
-        self.cost_spin.setValue(self.focus.cost)
+        self.cost_spin.setValue(max(1, min(365, int(getattr(self.focus, 'cost', 10) or 10))))
         self.desc_edit = QTextEdit()
-        with silent_operation("set_desc_tab_stop"):
-            # Make tab spaces 2x smaller for compact display
-            self.desc_edit.setTabStopDistance(self.desc_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        # Make tab spaces 2x smaller for compact display
+        self.desc_edit.setTabStopDistance(self.desc_edit.fontMetrics().horizontalAdvance(' ') * 4)
         self.desc_edit.setPlainText(self.focus.description)
         self.desc_edit.setMaximumHeight(120)
         # Icon selector row
@@ -257,16 +337,14 @@ class FocusEditDialog(EditorDialogBase):
             self.icon_label.setText("(no icon)")
         from_lib_btn = QPushButton("From Library...")
         def _from_lib():
-            with silent_operation("open_icon_library"):
-                # parent is main editor; try to use its icon library
-                editor = self.parent() if hasattr(self, 'parent') else None
-                lib = getattr(editor, 'icon_library', {}) if editor else {}
-                dlg = IconLibraryDialog(lib, parent=self)
-                if dlg.exec() == QDialog.DialogCode.Accepted and getattr(dlg, 'selected', None):
-                    # icon library may return a short identifier; keep as-is but attach tooltip
-                    sel = str(dlg.selected)
-                    with silent_operation("set_icon_path_display"):
-                        set_widget_path_display(self.icon_label, sel, max_len=60)
+            # parent is main editor; try to use its icon library
+            editor = self.parent() if hasattr(self, 'parent') else None
+            lib = getattr(editor, 'icon_library', {}) if editor else {}
+            dlg = IconLibraryDialog(lib, parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted and getattr(dlg, 'selected', None):
+                # icon library may return a short identifier; keep as-is but attach tooltip
+                sel = str(dlg.selected)
+                set_widget_path_display(self.icon_label, sel, max_len=60)
         from_lib_btn.clicked.connect(_from_lib)
         icon_btn.clicked.connect(_choose_icon)
         remove_icon_btn.clicked.connect(_remove_icon)
@@ -296,22 +374,65 @@ class FocusEditDialog(EditorDialogBase):
         self.mutex_edit = QLineEdit(",".join(self.focus.mutually_exclusive))
         # Checkbox to control grouped prerequisites output (either/or vs multiple blocks)
         self.prereq_grouped_chk = QCheckBox("Group prerequisites into a single block")
-        with silent_operation("set_prereq_grouped_checked"):
-            self.prereq_grouped_chk.setChecked(bool(getattr(self.focus, 'prerequisites_grouped', False)))
+        self.prereq_grouped_chk.setChecked(bool(getattr(self.focus, 'prerequisites_grouped', False)))
         self.available_edit = QTextEdit()
-        with silent_operation("set_available_tab_stop"):
-            self.available_edit.setTabStopDistance(self.available_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.available_edit.setTabStopDistance(self.available_edit.fontMetrics().horizontalAdvance(' ') * 4)
         self.available_edit.setPlainText(self.focus.available)
         self.available_edit.setMaximumHeight(80)
         self.bypass_edit = QTextEdit()
-        with silent_operation("set_bypass_tab_stop"):
-            self.bypass_edit.setTabStopDistance(self.bypass_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.bypass_edit.setTabStopDistance(self.bypass_edit.fontMetrics().horizontalAdvance(' ') * 4)
         self.bypass_edit.setPlainText(self.focus.bypass)
         self.bypass_edit.setMaximumHeight(80)
         self.ai_spin = QSpinBox()
         self.ai_spin.setRange(0, 100)
-        self.ai_spin.setValue(self.focus.ai_will_do)
-        advanced_layout.addRow("Prerequisites:", self.prereq_edit)
+        self.ai_spin.setValue(max(0, min(100, int(getattr(self.focus, 'ai_will_do', 1) or 1))))
+        def _pick_focus_ids(target_edit: QLineEdit, title_txt: str):
+            editor = self.parent()
+            all_focuses = list(getattr(editor, 'focuses', []) or []) if editor is not None else []
+            if not all_focuses:
+                QMessageBox.information(self, title_txt, "No other focuses in this project yet.")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle(title_txt)
+            dlg.resize(360, 420)
+            lay = QVBoxLayout(dlg)
+            filt = QLineEdit()
+            filt.setPlaceholderText("Filter by ID or name…")
+            lay.addWidget(filt)
+            lw = QListWidget()
+            lw.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+            current = {s.strip() for s in target_edit.text().split(',') if s.strip()}
+            cur_id = self.id_edit.text().strip()
+            for fx in all_focuses:
+                fid = str(getattr(fx, 'id', '') or '')
+                if not fid or fid == cur_id:
+                    continue
+                fname = str(getattr(fx, 'name', '') or '')
+                it = QListWidgetItem(f"{fid} — {fname}" if fname else fid)
+                it.setData(Qt.ItemDataRole.UserRole, fid)
+                lw.addItem(it)
+                if fid in current:
+                    it.setSelected(True)
+            def _on_filter(q: str):
+                ql = q.strip().lower()
+                for i in range(lw.count()):
+                    it = lw.item(i)
+                    it.setHidden(bool(ql) and ql not in it.text().lower())
+            filt.textChanged.connect(_on_filter)
+            lay.addWidget(lw)
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            bb.accepted.connect(dlg.accept)
+            bb.rejected.connect(dlg.reject)
+            lay.addWidget(bb)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                chosen = [lw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lw.count()) if lw.item(i).isSelected()]
+                target_edit.setText(", ".join(chosen))
+        prereq_row = QHBoxLayout()
+        prereq_row.addWidget(self.prereq_edit)
+        prereq_pick_btn = QPushButton("Pick…")
+        prereq_pick_btn.clicked.connect(lambda: _pick_focus_ids(self.prereq_edit, "Pick Prerequisites"))
+        prereq_row.addWidget(prereq_pick_btn)
+        advanced_layout.addRow("Prerequisites:", prereq_row)
         advanced_layout.addRow("Grouping:", self.prereq_grouped_chk)
         # Prerequisite groups editor: list of groups, each with type (AND/OR) and comma-separated items
         groups_label = QLabel("Prerequisite groups (each group can be AND or OR and contains focus IDs):")
@@ -329,20 +450,22 @@ class FocusEditDialog(EditorDialogBase):
         grp_btn_layout.addWidget(self.remove_group_btn)
         advanced_layout.addRow(grp_btn_row)
         # Populate groups list from the focus model so existing groups are shown when dialog opens
-        with silent_operation("populate_prereq_groups"):
-            existing_groups = list(getattr(self.focus, 'prerequisites_groups', []) or [])
-            if existing_groups:
-                with silent_operation("clear_prereq_groups_list"):
-                    self.prereq_groups_list.clear()
-                for g in existing_groups:
-                    with silent_operation("add_prereq_group_item"):
-                        typ = (g.get('type') or 'AND') if isinstance(g, dict) else 'AND'
-                        items = list(g.get('items', []) if isinstance(g, dict) else [])
-                        itm = QListWidgetItem(f"{typ}: {','.join(items)}")
-                        itm.setData(Qt.ItemDataRole.UserRole, {'type': typ, 'items': items})
-                        with silent_operation("add_item_to_list"):
-                            self.prereq_groups_list.addItem(itm)
-        advanced_layout.addRow("Mutually Exclusive:", self.mutex_edit)
+        existing_groups = list(getattr(self.focus, 'prerequisites_groups', []) or [])
+        if existing_groups:
+            self.prereq_groups_list.clear()
+            for g in existing_groups:
+                typ = (g.get('type') or 'AND') if isinstance(g, dict) else 'AND'
+                items = list(g.get('items', []) if isinstance(g, dict) else [])
+                itm = QListWidgetItem(f"{typ}: {','.join(items)}")
+                itm.setData(Qt.ItemDataRole.UserRole, {'type': typ, 'items': items})
+                with silent_operation("add_item_to_list"):
+                    self.prereq_groups_list.addItem(itm)
+        mutex_row = QHBoxLayout()
+        mutex_row.addWidget(self.mutex_edit)
+        mutex_pick_btn = QPushButton("Pick…")
+        mutex_pick_btn.clicked.connect(lambda: _pick_focus_ids(self.mutex_edit, "Pick Mutually Exclusive"))
+        mutex_row.addWidget(mutex_pick_btn)
+        advanced_layout.addRow("Mutually Exclusive:", mutex_row)
         advanced_layout.addRow("Available Condition:", self.available_edit)
         advanced_layout.addRow("Bypass Condition:", self.bypass_edit)
 
@@ -371,50 +494,44 @@ class FocusEditDialog(EditorDialogBase):
         # Use a vertical layout so the completion reward QTextEdit can expand to fill the tab
         rewards_layout = QVBoxLayout()
         self.reward_edit = QTextEdit()
-        with silent_operation("set_reward_tab_stop"):
-            self.reward_edit.setTabStopDistance(self.reward_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.reward_edit.setTabStopDistance(self.reward_edit.fontMetrics().horizontalAdvance(' ') * 4)
         # If this focus is linked to an Event via the canvas, display only a concise
         # reference in the focus rewards panel (per UX: only event reference/trigger
         # should appear here). Otherwise, show the stored completion_reward.
-        with silent_operation("set_reward_edit_text"):
-            displayed = None
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, 'canvas'):
-                for ef in getattr(parent.canvas, '_event_focus_links', []):
-                    with silent_operation("check_event_focus_link"):
-                        fnode = getattr(ef, 'focus_node', None)
-                        evnode = getattr(ef, 'event_node', None)
-                        if fnode and getattr(getattr(fnode, 'focus', None), 'id', None) == getattr(self.focus, 'id', None):
-                            displayed = getattr(getattr(evnode, 'event', None), 'id', None)
-                            if displayed:
-                                break
-            if displayed:
-                self.reward_edit.setPlainText(f"country_event = {{ id = {displayed} }}")
-            else:
-                self.reward_edit.setPlainText(self.focus.completion_reward)
+        displayed = None
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, 'canvas'):
+            for ef in getattr(parent.canvas, '_event_focus_links', []):
+                fnode = getattr(ef, 'focus_node', None)
+                evnode = getattr(ef, 'event_node', None)
+                if fnode and getattr(getattr(fnode, 'focus', None), 'id', None) == getattr(self.focus, 'id', None):
+                    displayed = getattr(getattr(evnode, 'event', None), 'id', None)
+                    if displayed:
+                        break
+        if displayed:
+            self.reward_edit.setPlainText(f"country_event = {{ id = {displayed} }}")
+        else:
+            self.reward_edit.setPlainText(self.focus.completion_reward)
         # Allow the reward editor to expand and fill the tab
-        with silent_operation("set_reward_edit_size_policy"):
-            self.reward_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self.reward_edit.setMinimumHeight(200)
+        self.reward_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.reward_edit.setMinimumHeight(200)
         rewards_layout.addWidget(QLabel("Completion Reward:"))
         # Insert Effect button (opens effects browser and inserts snippet into reward editor)
         eff_row = QHBoxLayout()
         eff_row.addWidget(self.reward_edit)
-        with silent_operation("setup_effects_inserter"):
-            from _effects_inserter import EffectsInserterDialog
+        from _effects_inserter import EffectsInserterDialog
 
-            insert_eff_btn = QPushButton("Insert Effect…")
-            def _open_insert():
-                with silent_operation("open_effects_inserter"):
-                    dlg = EffectsInserterDialog(parent=self)
-                    if dlg.exec() == QDialog.DialogCode.Accepted and getattr(dlg, 'selected_snippet', None):
-                        cursor = self.reward_edit.textCursor()
-                        cursor.insertText(dlg.selected_snippet)
-                        self.reward_edit.setTextCursor(cursor)
-                        self.reward_edit.setFocus()
+        insert_eff_btn = QPushButton("Insert Effect…")
+        def _open_insert():
+            dlg = EffectsInserterDialog(parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted and getattr(dlg, 'selected_snippet', None):
+                cursor = self.reward_edit.textCursor()
+                cursor.insertText(dlg.selected_snippet)
+                self.reward_edit.setTextCursor(cursor)
+                self.reward_edit.setFocus()
 
-            insert_eff_btn.clicked.connect(_open_insert)
-            eff_row.addWidget(insert_eff_btn)
+        insert_eff_btn.clicked.connect(_open_insert)
+        eff_row.addWidget(insert_eff_btn)
 
         rewards_layout.addLayout(eff_row)
         rewards_tab.setLayout(rewards_layout)
@@ -455,17 +572,14 @@ class FocusEditDialog(EditorDialogBase):
         export_tab = QWidget()
         export_layout = QVBoxLayout()
         self.export_text = QTextEdit()
-        with silent_operation("set_export_text_mono_font"):
-            # monospace for code preview
-            mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-            self.export_text.setFont(mono)
-        with silent_operation("set_export_text_style"):
-            # Render tabs visually as 4 spaces for tighter preview layout
-            with silent_operation("set_export_tab_stop"):
-                self.export_text.setTabStopDistance(self.export_text.fontMetrics().horizontalAdvance(' ') * 4)
-            self.export_text.setReadOnly(True)
-            self.export_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-            self.export_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc;")
+        # monospace for code preview
+        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self.export_text.setFont(mono)
+        # Render tabs visually as 4 spaces for tighter preview layout
+        self.export_text.setTabStopDistance(self.export_text.fontMetrics().horizontalAdvance(' ') * 4)
+        self.export_text.setReadOnly(True)
+        self.export_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.export_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc;")
         export_layout.addWidget(QLabel("Export preview (HOI4 code for this focus):"))
         export_layout.addWidget(self.export_text)
         export_tab.setLayout(export_layout)
@@ -481,12 +595,11 @@ class FocusEditDialog(EditorDialogBase):
             self.lib_combo.setMinimumWidth(300)
             self.lib_combo.addItem("--- choose ---", None)
             for key, entry in self.library.items():
-                with silent_operation("add_library_combo_item"):
-                    if isinstance(entry, dict):
-                        label = entry.get("name") or entry.get("id") or key
-                    else:
-                        label = str(entry) if entry else key
-                    self.lib_combo.addItem(label, key)
+                if isinstance(entry, dict):
+                    label = entry.get("name") or entry.get("id") or key
+                else:
+                    label = str(entry) if entry else key
+                self.lib_combo.addItem(label, key)
             lib_apply_btn = QPushButton("Apply")
             lib_apply_btn.clicked.connect(self.apply_library_entry_to_fields)
             lib_layout.addWidget(self.lib_combo)
@@ -508,10 +621,9 @@ class FocusEditDialog(EditorDialogBase):
             pass
 
         # Populate relations lists and connect handlers
-        with silent_operation("populate_relations"):
-            self._populate_relations()
-            self.parents_list.itemClicked.connect(self._on_relation_clicked)
-            self.children_list.itemClicked.connect(self._on_relation_clicked)
+        self._populate_relations()
+        self.parents_list.itemClicked.connect(self._on_relation_clicked)
+        self.children_list.itemClicked.connect(self._on_relation_clicked)
 
     def _load_allow_branch_state(self):
         branch_text = str(getattr(self.focus, 'allow_branch', '') or '').strip()
@@ -557,101 +669,90 @@ class FocusEditDialog(EditorDialogBase):
 
     def _wire_live_update_handlers(self):
         # Live update export preview on any field change (including reward edits and icon changes)
-        with silent_operation("setup_live_update_handlers"):
-            # Keep export preview live
-            self.id_edit.textChanged.connect(self._update_export_preview)
-            self.name_edit.textChanged.connect(self._update_export_preview)
-            self.cost_spin.valueChanged.connect(lambda *_: self._update_export_preview())
-            self.desc_edit.textChanged.connect(self._update_export_preview)
-            self.prereq_edit.textChanged.connect(self._update_export_preview)
-            self.mutex_edit.textChanged.connect(self._update_export_preview)
-            self.available_edit.textChanged.connect(self._update_export_preview)
-            self.bypass_edit.textChanged.connect(self._update_export_preview)
-            self.ai_spin.valueChanged.connect(lambda *_: self._update_export_preview())
-            self.reward_edit.textChanged.connect(self._update_export_preview)
+        # Keep export preview live
+        self.id_edit.textChanged.connect(self._update_export_preview)
+        self.name_edit.textChanged.connect(self._update_export_preview)
+        self.cost_spin.valueChanged.connect(lambda *_: self._update_export_preview())
+        self.desc_edit.textChanged.connect(self._update_export_preview)
+        self.prereq_edit.textChanged.connect(self._update_export_preview)
+        self.mutex_edit.textChanged.connect(self._update_export_preview)
+        self.available_edit.textChanged.connect(self._update_export_preview)
+        self.bypass_edit.textChanged.connect(self._update_export_preview)
+        self.ai_spin.valueChanged.connect(lambda *_: self._update_export_preview())
+        self.reward_edit.textChanged.connect(self._update_export_preview)
 
-            # Also apply edits live to the focus model so visual changes appear instantly
-            def _maybe_refresh_canvas():
-                with silent_operation("maybe_refresh_canvas"):
-                    parent = self.parent() if hasattr(self, 'parent') else None
-                    canvas = getattr(parent, 'canvas', None) if parent is not None else None
-                    if canvas and hasattr(canvas, 'schedule_frame_update'):
-                        canvas.schedule_frame_update()
+        # Also apply edits live to the focus model so visual changes appear instantly
+        def _maybe_refresh_canvas():
+            parent = self.parent() if hasattr(self, 'parent') else None
+            canvas = getattr(parent, 'canvas', None) if parent is not None else None
+            if canvas and hasattr(canvas, 'schedule_frame_update'):
+                canvas.schedule_frame_update()
 
-            def _apply_id(v):
-                with silent_operation("apply_id"):
-                    self.focus.id = v.strip()
-                    _maybe_refresh_canvas()
-            def _apply_name(v):
-                with silent_operation("apply_name"):
-                    self.focus.name = v
-                    _maybe_refresh_canvas()
-            def _apply_cost(v):
-                with silent_operation("apply_cost"):
-                    self.focus.cost = int(v)
-                    _maybe_refresh_canvas()
-            def _apply_desc():
-                with silent_operation("apply_desc"):
-                    self.focus.description = self.desc_edit.toPlainText()
-                    _maybe_refresh_canvas()
-            def _apply_prereqs(v):
-                with silent_operation("apply_prereqs"):
-                    self.focus.prerequisites = [p.strip() for p in v.split(',') if p.strip()]
-                    _maybe_refresh_canvas()
-            def _apply_prereq_grouped(v=None):
-                with silent_operation("apply_prereq_grouped"):
-                    self.focus.prerequisites_grouped = bool(self.prereq_grouped_chk.isChecked())
-                    _maybe_refresh_canvas()
-            def _apply_mutex(v):
-                with silent_operation("apply_mutex"):
-                    self.focus.mutually_exclusive = [m.strip() for m in v.split(',') if m.strip()]
-                    _maybe_refresh_canvas()
-            def _apply_available():
-                with silent_operation("apply_available"):
-                    self.focus.available = self.available_edit.toPlainText()
-                    _maybe_refresh_canvas()
-            def _apply_bypass():
-                with silent_operation("apply_bypass"):
-                    self.focus.bypass = self.bypass_edit.toPlainText()
-                    _maybe_refresh_canvas()
-            def _apply_ai(v):
-                with silent_operation("apply_ai"):
-                    self.focus.ai_will_do = int(v)
-                    _maybe_refresh_canvas()
-            # wire live-update handlers with focus model updates
-            self.id_edit.textChanged.connect(_apply_id)
-            self.name_edit.textChanged.connect(_apply_name)
-            self.cost_spin.valueChanged.connect(_apply_cost)
-            self.desc_edit.textChanged.connect(lambda *_: _apply_desc())
-            self.prereq_edit.textChanged.connect(_apply_prereqs)
-            self.prereq_grouped_chk.stateChanged.connect(lambda *_: _apply_prereq_grouped())
-            self.mutex_edit.textChanged.connect(_apply_mutex)
-            self.available_edit.textChanged.connect(lambda *_: _apply_available())
-            self.bypass_edit.textChanged.connect(lambda *_: _apply_bypass())
-            self.ai_spin.valueChanged.connect(_apply_ai)
-            # completion_reward updates now only through mark_dirty checkbox and final accept
-            # the text field still updates preview but does not trigger live render sync.
-            # self.reward_edit.textChanged.connect(lambda *_: _apply_reward())
+        def _apply_id(v):
+            self.focus.id = v.strip()
+            _maybe_refresh_canvas()
+        def _apply_name(v):
+            self.focus.name = v
+            _maybe_refresh_canvas()
+        def _apply_cost(v):
+            self.focus.cost = int(v)
+            _maybe_refresh_canvas()
+        def _apply_desc():
+            self.focus.description = self.desc_edit.toPlainText()
+            _maybe_refresh_canvas()
+        def _apply_prereqs(v):
+            self.focus.prerequisites = [p.strip() for p in v.split(',') if p.strip()]
+            _maybe_refresh_canvas()
+        def _apply_prereq_grouped(v=None):
+            self.focus.prerequisites_grouped = bool(self.prereq_grouped_chk.isChecked())
+            _maybe_refresh_canvas()
+        def _apply_mutex(v):
+            self.focus.mutually_exclusive = [m.strip() for m in v.split(',') if m.strip()]
+            _maybe_refresh_canvas()
+        def _apply_available():
+            self.focus.available = self.available_edit.toPlainText()
+            _maybe_refresh_canvas()
+        def _apply_bypass():
+            self.focus.bypass = self.bypass_edit.toPlainText()
+            _maybe_refresh_canvas()
+        def _apply_ai(v):
+            self.focus.ai_will_do = int(v)
+            _maybe_refresh_canvas()
+        # wire live-update handlers with focus model updates
+        self.id_edit.textChanged.connect(_apply_id)
+        self.name_edit.textChanged.connect(_apply_name)
+        self.cost_spin.valueChanged.connect(_apply_cost)
+        self.desc_edit.textChanged.connect(lambda *_: _apply_desc())
+        self.prereq_edit.textChanged.connect(_apply_prereqs)
+        self.prereq_grouped_chk.stateChanged.connect(lambda *_: _apply_prereq_grouped())
+        self.mutex_edit.textChanged.connect(_apply_mutex)
+        self.available_edit.textChanged.connect(lambda *_: _apply_available())
+        self.bypass_edit.textChanged.connect(lambda *_: _apply_bypass())
+        self.ai_spin.valueChanged.connect(_apply_ai)
+        # completion_reward updates now only through mark_dirty checkbox and final accept
+        # the text field still updates preview but does not trigger live render sync.
+        # self.reward_edit.textChanged.connect(lambda *_: _apply_reward())
 
-            # Also refresh when icon changes via any of the buttons
-            def _refresh_after_icon_change():
-                with silent_operation("refresh_after_icon_change"):
-                    self._update_export_preview()
-            self.icon_btn.clicked.connect(_refresh_after_icon_change)
-            self.remove_icon_btn.clicked.connect(_refresh_after_icon_change)
-            self.from_lib_btn.clicked.connect(_refresh_after_icon_change)
-
-            # Initial render
+        # Also refresh when icon changes via any of the buttons
+        def _refresh_after_icon_change():
             self._update_export_preview()
+        self.icon_btn.clicked.connect(_refresh_after_icon_change)
+        self.remove_icon_btn.clicked.connect(_refresh_after_icon_change)
+        self.from_lib_btn.clicked.connect(_refresh_after_icon_change)
+
+        # Initial render
+        try:
+            self._update_export_preview()
+        except Exception:
+            pass
 
         # Wire group controls (Add/Remove/Edit) if they exist
-        with silent_operation("wire_group_controls"):
-            if hasattr(self, 'add_group_btn'):
-                self.add_group_btn.clicked.connect(lambda *_: self._on_add_group())
-            if hasattr(self, 'remove_group_btn'):
-                self.remove_group_btn.clicked.connect(lambda *_: self._on_remove_group())
-            if hasattr(self, 'prereq_groups_list'):
-                self.prereq_groups_list.itemDoubleClicked.connect(lambda itm: self._on_edit_group_item(itm))
+        if hasattr(self, 'add_group_btn'):
+            self.add_group_btn.clicked.connect(lambda *_: self._on_add_group())
+        if hasattr(self, 'remove_group_btn'):
+            self.remove_group_btn.clicked.connect(lambda *_: self._on_remove_group())
+        if hasattr(self, 'prereq_groups_list'):
+            self.prereq_groups_list.itemDoubleClicked.connect(lambda itm: self._on_edit_group_item(itm))
 
     def apply_library_entry_to_fields(self):
         key = self.lib_combo.currentData()
@@ -684,21 +785,18 @@ class FocusEditDialog(EditorDialogBase):
         else:
             self.prereq_edit.setText(str(prereqs) if prereqs else "")
         # Apply grouping flag if provided by the library entry
-        with silent_operation("apply_prereq_grouped_from_library"):
-            if 'prerequisites_grouped' in safe_entry:
-                self.prereq_grouped_chk.setChecked(bool(safe_entry.get('prerequisites_grouped')))
+        if 'prerequisites_grouped' in safe_entry:
+            self.prereq_grouped_chk.setChecked(bool(safe_entry.get('prerequisites_grouped')))
         # Load prerequisite groups if provided
-        with silent_operation("load_prereq_groups_from_library"):
-            groups = safe_entry.get('prerequisites_groups', None)
-            if groups is not None and hasattr(self, 'prereq_groups_list'):
-                with silent_operation("populate_prereq_groups_from_library"):
-                    self.prereq_groups_list.clear()
-                    for g in groups:
-                        typ = g.get('type', 'AND')
-                        items = g.get('items', []) or []
-                        itm = QListWidgetItem(f"{typ}: {','.join(items)}")
-                        itm.setData(Qt.ItemDataRole.UserRole, {'type': typ, 'items': items})
-                        self.prereq_groups_list.addItem(itm)
+        groups = safe_entry.get('prerequisites_groups', None)
+        if groups is not None and hasattr(self, 'prereq_groups_list'):
+            self.prereq_groups_list.clear()
+            for g in groups:
+                typ = g.get('type', 'AND')
+                items = g.get('items', []) or []
+                itm = QListWidgetItem(f"{typ}: {','.join(items)}")
+                itm.setData(Qt.ItemDataRole.UserRole, {'type': typ, 'items': items})
+                self.prereq_groups_list.addItem(itm)
 
         # Handle mutually exclusive safely
         mutex = safe_entry.get("mutually_exclusive", [])
@@ -710,28 +808,24 @@ class FocusEditDialog(EditorDialogBase):
         self.available_edit.setPlainText(safe_entry.get("available", self.available_edit.toPlainText()))
         self.bypass_edit.setPlainText(safe_entry.get("bypass", self.bypass_edit.toPlainText()))
         # If focus is linked to an event, show only the concise event reference
-        with silent_operation("check_event_focus_links_for_reward"):
-            displayed = None
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, 'canvas'):
-                for ef in getattr(parent.canvas, '_event_focus_links', []):
-                    with silent_operation("check_single_event_focus_link"):
-                        fnode = getattr(ef, 'focus_node', None)
-                        evnode = getattr(ef, 'event_node', None)
-                        if fnode and getattr(getattr(fnode, 'focus', None), 'id', None) == safe_entry.get('id', self.id_edit.text()):
-                            displayed = getattr(getattr(evnode, 'event', None), 'id', None)
-                            if displayed:
-                                break
-            if displayed:
-                self.reward_edit.setPlainText(f"country_event = {{ id = {displayed} }}")
-            else:
-                self.reward_edit.setPlainText(safe_entry.get("completion_reward", self.reward_edit.toPlainText()))
+        displayed = None
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, 'canvas'):
+            for ef in getattr(parent.canvas, '_event_focus_links', []):
+                fnode = getattr(ef, 'focus_node', None)
+                evnode = getattr(ef, 'event_node', None)
+                if fnode and getattr(getattr(fnode, 'focus', None), 'id', None) == safe_entry.get('id', self.id_edit.text()):
+                    displayed = getattr(getattr(evnode, 'event', None), 'id', None)
+                    if displayed:
+                        break
+        if displayed:
+            self.reward_edit.setPlainText(f"country_event = {{ id = {displayed} }}")
+        else:
+            self.reward_edit.setPlainText(safe_entry.get("completion_reward", self.reward_edit.toPlainText()))
         self.ai_spin.setValue(safe_entry.get("ai_will_do", self.ai_spin.value()))
-        with silent_operation("refresh_export_preview_after_library"):
-            # refresh export preview after applying library entry
-            if hasattr(self, '_update_export_preview'):
-                with silent_operation("call_update_export_preview"):
-                    self._update_export_preview()
+        # refresh export preview after applying library entry
+        if hasattr(self, '_update_export_preview'):
+            self._update_export_preview()
 
     def accept(self):
         # Update focus with new values
@@ -745,25 +839,23 @@ class FocusEditDialog(EditorDialogBase):
         self.focus.prerequisites = [p.strip() for p in self.prereq_edit.text().split(",") if p.strip()]
         self.focus.mutually_exclusive = [m.strip() for m in self.mutex_edit.text().split(",") if m.strip()]
         # store grouped flag
-        with silent_operation("store_prerequisites_grouped"):
-            self.focus.prerequisites_grouped = bool(self.prereq_grouped_chk.isChecked())
+        self.focus.prerequisites_grouped = bool(self.prereq_grouped_chk.isChecked())
         # store groups
-        with silent_operation("store_prereq_groups"):
-            groups = []
-            if hasattr(self, 'prereq_groups_list'):
-                for i in range(self.prereq_groups_list.count()):
-                    item = self.prereq_groups_list.item(i)
-                    g = item.data(Qt.ItemDataRole.UserRole)
-                    if not g:
-                        txt = item.text()
-                        if ':' in txt:
-                            typ, rest = txt.split(':', 1)
-                            items = [s.strip() for s in rest.split(',') if s.strip()]
-                            g = {'type': typ.strip(), 'items': items}
-                        else:
-                            continue
-                    groups.append({'type': g.get('type', 'AND'), 'items': list(g.get('items', []))})
-            self.focus.prerequisites_groups = groups
+        groups = []
+        if hasattr(self, 'prereq_groups_list'):
+            for i in range(self.prereq_groups_list.count()):
+                item = self.prereq_groups_list.item(i)
+                g = item.data(Qt.ItemDataRole.UserRole)
+                if not g:
+                    txt = item.text()
+                    if ':' in txt:
+                        typ, rest = txt.split(':', 1)
+                        items = [s.strip() for s in rest.split(',') if s.strip()]
+                        g = {'type': typ.strip(), 'items': items}
+                    else:
+                        continue
+                groups.append({'type': g.get('type', 'AND'), 'items': list(g.get('items', []))})
+        self.focus.prerequisites_groups = groups
         self.focus.available = self.available_edit.toPlainText()
         self.focus.bypass = self.bypass_edit.toPlainText()
 
@@ -789,99 +881,89 @@ class FocusEditDialog(EditorDialogBase):
 
         self.focus.ai_will_do = self.ai_spin.value()
         # Ensure mutual exclusivity is symmetric in the main model
-        with silent_operation("sync_mutual_exclusive"):
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, '_sync_mutual_exclusive'):
-                with silent_operation("call_sync_mutual_exclusive"):
-                    parent._sync_mutual_exclusive(self.focus.id)
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, '_sync_mutual_exclusive'):
+            parent._sync_mutual_exclusive(self.focus.id)
         # Sync visual connections on the canvas to reflect any manual prerequisite edits
-        with silent_operation("sync_canvas_connections"):
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, 'canvas'):
-                canvas = parent.canvas
-                # Ensure connections exist for each declared prerequisite (parent_id -> this_focus_id)
-                my_id = getattr(self.focus, 'id', None)
-                # Start with explicit prerequisites
-                explicit_parents = list(getattr(self.focus, 'prerequisites', []) or [])
-                # Include any parents declared via prerequisite groups and remember their group type for styling
-                parent_kind = {}
-                groups = list(getattr(self.focus, 'prerequisites_groups', []) or [])
-                for g in groups:
-                    with silent_operation("process_prereq_group"):
-                        typ = (g.get('type') or 'AND') if isinstance(g, dict) else 'AND'
-                        items = list(g.get('items', []) if isinstance(g, dict) else [])
-                        for pid in items:
-                            if pid and pid not in parent_kind:
-                                parent_kind[pid] = typ
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, 'canvas'):
+            canvas = parent.canvas
+            # Ensure connections exist for each declared prerequisite (parent_id -> this_focus_id)
+            my_id = getattr(self.focus, 'id', None)
+            # Start with explicit prerequisites
+            explicit_parents = list(getattr(self.focus, 'prerequisites', []) or [])
+            # Include any parents declared via prerequisite groups and remember their group type for styling
+            parent_kind = {}
+            groups = list(getattr(self.focus, 'prerequisites_groups', []) or [])
+            for g in groups:
+                typ = (g.get('type') or 'AND') if isinstance(g, dict) else 'AND'
+                items = list(g.get('items', []) if isinstance(g, dict) else [])
+                for pid in items:
+                    if pid and pid not in parent_kind:
+                        parent_kind[pid] = typ
 
-                # desired_parents is the union of explicit parents and group items
-                desired_parents = list(dict.fromkeys(explicit_parents + list(parent_kind.keys())))
+            # desired_parents is the union of explicit parents and group items
+            desired_parents = list(dict.fromkeys(explicit_parents + list(parent_kind.keys())))
 
-                # Create missing connections and update styling for group-declared parents
-                for pid in desired_parents:
-                    with silent_operation("create_or_update_connection"):
-                        if not pid or pid not in getattr(canvas, 'nodes', {}):
+            # Create missing connections and update styling for group-declared parents
+            for pid in desired_parents:
+                if not pid or pid not in getattr(canvas, 'nodes', {}):
+                    continue
+                # check if connection exists
+                exists = None
+                for conn in list(getattr(canvas, 'connections', [])):
+                    with silent_operation("check_connection"):
+                        if not (hasattr(conn, 'start_node') and hasattr(conn, 'end_node')):
                             continue
-                        # check if connection exists
-                        exists = None
-                        for conn in list(getattr(canvas, 'connections', [])):
-                            with silent_operation("check_connection"):
-                                if not (hasattr(conn, 'start_node') and hasattr(conn, 'end_node')):
-                                    continue
-                                s = getattr(getattr(conn, 'start_node', None), 'focus', None)
-                                e = getattr(getattr(conn, 'end_node', None), 'focus', None)
-                                if s is None or e is None:
-                                    continue
-                                if getattr(s, 'id', None) == pid and getattr(e, 'id', None) == my_id:
-                                    exists = conn
-                                    break
-                        if exists is None:
-                            with silent_operation("create_new_connection"):
-                                line = canvas.create_connection(pid, my_id)
-                                # if this parent came from a group, attach kind/style
-                                kind = parent_kind.get(pid)
-                                if kind and hasattr(line, 'set_prereq_style'):
-                                    with silent_operation("set_new_conn_prereq_style"):
-                                        line.prereq_kind = kind
-                                        line.set_prereq_style(kind)
-                        else:
-                            # update existing connection's style if group declares a kind
-                            with silent_operation("update_existing_connection_style"):
-                                kind = parent_kind.get(pid)
-                                if kind:
-                                    exists.prereq_kind = kind
-                                    if hasattr(exists, 'set_prereq_style'):
-                                        with silent_operation("set_existing_conn_prereq_style"):
-                                            exists.set_prereq_style(kind)
+                        s = getattr(getattr(conn, 'start_node', None), 'focus', None)
+                        e = getattr(getattr(conn, 'end_node', None), 'focus', None)
+                        if s is None or e is None:
+                            continue
+                        if getattr(s, 'id', None) == pid and getattr(e, 'id', None) == my_id:
+                            exists = conn
+                            break
+                if exists is None:
+                    with silent_operation("create_new_connection"):
+                        line = canvas.create_connection(pid, my_id)
+                        # if this parent came from a group, attach kind/style
+                        kind = parent_kind.get(pid)
+                        if kind and hasattr(line, 'set_prereq_style'):
+                            with silent_operation("set_new_conn_prereq_style"):
+                                line.prereq_kind = kind
+                                line.set_prereq_style(kind)
+                else:
+                    # update existing connection's style if group declares a kind
+                    with silent_operation("update_existing_connection_style"):
+                        kind = parent_kind.get(pid)
+                        if kind:
+                            exists.prereq_kind = kind
+                            if hasattr(exists, 'set_prereq_style'):
+                                with silent_operation("set_existing_conn_prereq_style"):
+                                    exists.set_prereq_style(kind)
 
-                # Remove stale connections that no longer correspond to any declared prerequisite
-                with silent_operation("remove_stale_connections"):
-                    for conn in list(getattr(canvas, 'connections', [])):
-                        with silent_operation("check_stale_connection"):
-                            if not (hasattr(conn, 'start_node') and hasattr(conn, 'end_node')):
-                                continue
-                            s = getattr(getattr(conn, 'start_node', None), 'focus', None)
-                            e = getattr(getattr(conn, 'end_node', None), 'focus', None)
-                            if s is None or e is None:
-                                continue
-                            # Only consider connections that end at this focus
-                            if getattr(e, 'id', None) != my_id:
-                                continue
-                            if getattr(s, 'id', None) not in desired_parents:
-                                with silent_operation("remove_connection"):
-                                    canvas.remove_connection(conn)
+            # Remove stale connections that no longer correspond to any declared prerequisite
+            for conn in list(getattr(canvas, 'connections', [])):
+                with silent_operation("check_stale_connection"):
+                    if not (hasattr(conn, 'start_node') and hasattr(conn, 'end_node')):
+                        continue
+                    s = getattr(getattr(conn, 'start_node', None), 'focus', None)
+                    e = getattr(getattr(conn, 'end_node', None), 'focus', None)
+                    if s is None or e is None:
+                        continue
+                    # Only consider connections that end at this focus
+                    if getattr(e, 'id', None) != my_id:
+                        continue
+                    if getattr(s, 'id', None) not in desired_parents:
+                        with silent_operation("remove_connection"):
+                            canvas.remove_connection(conn)
 
-                # Refresh visuals (mutex connectors and line colors)
-                with silent_operation("refresh_mutex_connectors"):
-                    canvas.refresh_mutex_connectors()
-                with silent_operation("refresh_connection_colors"):
-                    canvas.refresh_connection_colors()
-                with silent_operation("update_canvas"):
-                    canvas.update()
-                with silent_operation("schedule_frame_update"):
-                    # schedule frame/layout update if available
-                    canvas._frames_dirty = True
-                    canvas.schedule_frame_update()
+            # Refresh visuals (mutex connectors and line colors)
+            canvas.refresh_mutex_connectors()
+            canvas.refresh_connection_colors()
+            canvas.update()
+            # schedule frame/layout update if available
+            canvas._frames_dirty = True
+            canvas.schedule_frame_update()
         super().accept()
 
     def _populate_relations(self):
@@ -918,134 +1000,121 @@ class FocusEditDialog(EditorDialogBase):
 
     # --- Prerequisite groups editor handlers ---
     def _on_add_group(self):
-        with silent_operation("add_prereq_group"):
-            # Ask for group type first
-            typ, ok = QInputDialog.getItem(self, 'Add Prerequisite Group', 'Type:', ['AND', 'OR'], 0, False)
-            if not ok:
-                return
-            items_txt, ok2 = QInputDialog.getText(self, 'Add Prerequisite Group', 'Items (comma-separated IDs):')
-            if not ok2:
-                return
-            typ = typ or 'AND'
-            items = [s.strip() for s in str(items_txt or '').split(',') if s.strip()]
-            g = {'type': typ, 'items': items}
-            itm = QListWidgetItem(f"{typ}: {','.join(items)}")
-            itm.setData(Qt.ItemDataRole.UserRole, g)
-            with silent_operation("add_group_to_list"):
-                self.prereq_groups_list.addItem(itm)
-            with silent_operation("update_export_preview_after_add_group"):
-                self._update_export_preview()
+        # Ask for group type first
+        typ, ok = QInputDialog.getItem(self, 'Add Prerequisite Group', 'Type:', ['AND', 'OR'], 0, False)
+        if not ok:
+            return
+        items_txt, ok2 = QInputDialog.getText(self, 'Add Prerequisite Group', 'Items (comma-separated IDs):')
+        if not ok2:
+            return
+        typ = typ or 'AND'
+        items = [s.strip() for s in str(items_txt or '').split(',') if s.strip()]
+        g = {'type': typ, 'items': items}
+        itm = QListWidgetItem(f"{typ}: {','.join(items)}")
+        itm.setData(Qt.ItemDataRole.UserRole, g)
+        self.prereq_groups_list.addItem(itm)
+        self._update_export_preview()
 
     def _on_remove_group(self):
-        with silent_operation("remove_prereq_group"):
-            sels = list(self.prereq_groups_list.selectedItems()) if hasattr(self, 'prereq_groups_list') else []
-            for s in sels:
-                with silent_operation("remove_single_group"):
-                    row = self.prereq_groups_list.row(s)
-                    self.prereq_groups_list.takeItem(row)
-            with silent_operation("update_export_preview_after_remove_group"):
-                self._update_export_preview()
+        sels = list(self.prereq_groups_list.selectedItems()) if hasattr(self, 'prereq_groups_list') else []
+        for s in sels:
+            row = self.prereq_groups_list.row(s)
+            self.prereq_groups_list.takeItem(row)
+        self._update_export_preview()
 
     def _on_edit_group_item(self, item: QListWidgetItem):
-        with silent_operation("edit_prereq_group_item"):
-            g = item.data(Qt.ItemDataRole.UserRole) or {}
-            dlg = QDialog(self)
-            dlg.setWindowTitle('Edit Prerequisite Group')
-            layout = QFormLayout(dlg)
-            type_cb = QComboBox(); type_cb.addItems(['AND', 'OR'])
-            with silent_operation("set_type_cb_current_text"):
-                type_cb.setCurrentText(g.get('type', 'AND'))
-            items_edit = QLineEdit(','.join(g.get('items', []) if g else []))
-            layout.addRow('Type:', type_cb)
-            layout.addRow('Items:', items_edit)
-            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
-            layout.addWidget(btns)
-            btns.accepted.connect(dlg.accept)
-            btns.rejected.connect(dlg.reject)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                typ = type_cb.currentText() or 'AND'
-                items = [s.strip() for s in items_edit.text().split(',') if s.strip()]
-                new_g = {'type': typ, 'items': items}
-                item.setText(f"{typ}: {','.join(items)}")
-                item.setData(Qt.ItemDataRole.UserRole, new_g)
-                with silent_operation("update_export_preview_after_edit_group"):
-                    self._update_export_preview()
+        g = item.data(Qt.ItemDataRole.UserRole) or {}
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Edit Prerequisite Group')
+        layout = QFormLayout(dlg)
+        type_cb = QComboBox(); type_cb.addItems(['AND', 'OR'])
+        type_cb.setCurrentText(g.get('type', 'AND'))
+        items_edit = QLineEdit(','.join(g.get('items', []) if g else []))
+        layout.addRow('Type:', type_cb)
+        layout.addRow('Items:', items_edit)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
+        layout.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            typ = type_cb.currentText() or 'AND'
+            items = [s.strip() for s in items_edit.text().split(',') if s.strip()]
+            new_g = {'type': typ, 'items': items}
+            item.setText(f"{typ}: {','.join(items)}")
+            item.setData(Qt.ItemDataRole.UserRole, new_g)
+            self._update_export_preview()
 
     def _on_relation_clicked(self, item: QListWidgetItem):
         target = item.data(Qt.ItemDataRole.UserRole)
         if not target:
             return
-        with silent_operation("handle_relation_clicked"):
-            editor = self.parent()
-            if not editor:
-                return
-            canvas = getattr(editor, 'canvas', None)
-            view = getattr(editor, 'view', None)
-            if canvas and hasattr(canvas, 'nodes'):
-                node = canvas.nodes.get(target)
-                if node:
-                    # Select the node and center the view
-                    node.setSelected(True)
-                    if view and hasattr(view, 'centerOn'):
-                        view.centerOn(node)
-                if hasattr(canvas, 'highlight_lineage'):
-                    canvas.highlight_lineage(target)
+        editor = self.parent()
+        if not editor:
+            return
+        canvas = getattr(editor, 'canvas', None)
+        view = getattr(editor, 'view', None)
+        if canvas and hasattr(canvas, 'nodes'):
+            node = canvas.nodes.get(target)
+            if node:
+                # Select the node and center the view
+                node.setSelected(True)
+                if view and hasattr(view, 'centerOn'):
+                    view.centerOn(node)
+            if hasattr(canvas, 'highlight_lineage'):
+                canvas.highlight_lineage(target)
 
     def _format_focus_export(self) -> str:
         """Return a HOI4-formatted single focus block using the main window's exact formatter."""
-        with silent_operation("format_focus_export"):
-            # Build a temporary Focus reflecting current editor field values
-            branch_val = ''
-            if getattr(self, 'allow_branch_chk', None) and self.allow_branch_chk.isChecked():
-                branch_target = getattr(self, 'allow_branch_focus', None)
-                if branch_target is not None:
-                    t = str(branch_target.text().strip())
-                    if t:
-                        branch_val = f"has_completed_focus = {t}"
+        # Build a temporary Focus reflecting current editor field values
+        branch_val = ''
+        if getattr(self, 'allow_branch_chk', None) and self.allow_branch_chk.isChecked():
+            branch_target = getattr(self, 'allow_branch_focus', None)
+            if branch_target is not None:
+                t = str(branch_target.text().strip())
+                if t:
+                    branch_val = f"has_completed_focus = {t}"
 
-            tmp = Focus(
-                id=self.id_edit.text().strip() or getattr(self.focus, 'id', ''),
-                name=self.name_edit.text().strip(),
-                x=int(getattr(self.focus, 'x', 0) or 0),
-                y=int(getattr(self.focus, 'y', 0) or 0),
-                cost=int(self.cost_spin.value()),
-                description=self.desc_edit.toPlainText(),
-                prerequisites=[p.strip() for p in self.prereq_edit.text().split(',') if p.strip()],
-                mutually_exclusive=[m.strip() for m in self.mutex_edit.text().split(',') if m.strip()],
-                available=self.available_edit.toPlainText(),
-                bypass=self.bypass_edit.toPlainText(),
-                completion_reward=self.reward_edit.toPlainText(),
-                ai_will_do=int(self.ai_spin.value()),
-                allow_branch=branch_val,
-                network_id=getattr(self.focus, 'network_id', None),
-                icon=(None if (self.icon_label.text().strip() in ("(no icon)", "")) else self.icon_label.text().strip()),
-            )
-            # if prereq groups UI present, attach to tmp so parent.format_focus_block can use it
-            with silent_operation("attach_prereq_groups_to_tmp"):
-                if hasattr(self, 'prereq_groups_list'):
-                    groups = []
-                    for i in range(self.prereq_groups_list.count()):
-                        item = self.prereq_groups_list.item(i)
-                        g = item.data(Qt.ItemDataRole.UserRole) or {}
-                        if not g:
-                            txt = item.text()
-                            if ':' in txt:
-                                typ, rest = txt.split(':', 1)
-                                g = {'type': typ.strip(), 'items': [s.strip() for s in rest.split(',') if s.strip()]}
-                            else:
-                                continue
-                        groups.append({'type': g.get('type', 'AND'), 'items': list(g.get('items', []))})
-                    tmp.prerequisites_groups = groups
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, 'format_focus_block'):
-                return str(parent.format_focus_block(tmp) or '')
+        tmp = Focus(
+            id=self.id_edit.text().strip() or getattr(self.focus, 'id', ''),
+            name=self.name_edit.text().strip(),
+            x=int(getattr(self.focus, 'x', 0) or 0),
+            y=int(getattr(self.focus, 'y', 0) or 0),
+            cost=int(self.cost_spin.value()),
+            description=self.desc_edit.toPlainText(),
+            prerequisites=[p.strip() for p in self.prereq_edit.text().split(',') if p.strip()],
+            mutually_exclusive=[m.strip() for m in self.mutex_edit.text().split(',') if m.strip()],
+            available=self.available_edit.toPlainText(),
+            bypass=self.bypass_edit.toPlainText(),
+            completion_reward=self.reward_edit.toPlainText(),
+            ai_will_do=int(self.ai_spin.value()),
+            allow_branch=branch_val,
+            network_id=getattr(self.focus, 'network_id', None),
+            icon=(None if (self.icon_label.text().strip() in ("(no icon)", "")) else self.icon_label.text().strip()),
+        )
+        # if prereq groups UI present, attach to tmp so parent.format_focus_block can use it
+        if hasattr(self, 'prereq_groups_list'):
+            groups = []
+            for i in range(self.prereq_groups_list.count()):
+                item = self.prereq_groups_list.item(i)
+                g = item.data(Qt.ItemDataRole.UserRole) or {}
+                if not g:
+                    txt = item.text()
+                    if ':' in txt:
+                        typ, rest = txt.split(':', 1)
+                        g = {'type': typ.strip(), 'items': [s.strip() for s in rest.split(',') if s.strip()]}
+                    else:
+                        continue
+                groups.append({'type': g.get('type', 'AND'), 'items': list(g.get('items', []))})
+            tmp.prerequisites_groups = groups
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, 'format_focus_block'):
+            return str(parent.format_focus_block(tmp) or '')
         # Fallback to empty string on any error
         return ""
 
     def _update_export_preview(self) -> None:
-        with silent_operation("update_export_preview"):
-            text = self._format_focus_export()
-            self.export_text.setPlainText(text)
+        text = self._format_focus_export()
+        self.export_text.setPlainText(text)
 
 
 class EventEditDialog(EditorDialogBase):
@@ -1065,14 +1134,11 @@ class EventEditDialog(EditorDialogBase):
         self.id_edit = QLineEdit(self.event.id)
         self.title_edit = QLineEdit(self.event.title)
         self.desc_edit = QTextEdit(); self.desc_edit.setPlainText(self.event.description); self.desc_edit.setMaximumHeight(140)
-        with silent_operation("set_desc_edit_tab_stop"):
-            self.desc_edit.setTabStopDistance(self.desc_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.desc_edit.setTabStopDistance(self.desc_edit.fontMetrics().horizontalAdvance(' ') * 4)
         # Ensure text is visible in dark themes: set a neutral dark background and light text
-        with silent_operation("set_desc_edit_style"):
-            self.desc_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
-            # prefer plain text to avoid unexpected rich text rendering
-            with silent_operation("set_desc_accept_rich_text"):
-                self.desc_edit.setAcceptRichText(False)
+        self.desc_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
+        # prefer plain text to avoid unexpected rich text rendering
+        self.desc_edit.setAcceptRichText(False)
         basic_form.addRow("ID:", self.id_edit)
         basic_form.addRow("Title:", self.title_edit)
         basic_form.addRow("Description:", self.desc_edit)
@@ -1084,24 +1150,18 @@ class EventEditDialog(EditorDialogBase):
         self.trigger_edit = QTextEdit()
         self.trigger_edit.setPlainText(trig_text)
         self.trigger_edit.setMaximumHeight(160)
-        with silent_operation("set_trigger_edit_tab_stop"):
-            self.trigger_edit.setTabStopDistance(self.trigger_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.trigger_edit.setTabStopDistance(self.trigger_edit.fontMetrics().horizontalAdvance(' ') * 4)
         # Make sure text is readable in dark themes
-        with silent_operation("set_trigger_edit_style"):
-            self.trigger_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
-            with silent_operation("set_trigger_accept_rich_text"):
-                self.trigger_edit.setAcceptRichText(False)
+        self.trigger_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
+        self.trigger_edit.setAcceptRichText(False)
 
         opts_text = self.event.options_block if (isinstance(self.event.options_block, str) and self.event.options_block.strip()) else (f"option = {{\n\tname = {self.event.id}.a\n\t# add effects here\n}}\n\n# Add additional options as needed\n")
         self.options_edit = QTextEdit()
         self.options_edit.setPlainText(opts_text)
         self.options_edit.setMaximumHeight(220)
-        with silent_operation("set_options_edit_tab_stop"):
-            self.options_edit.setTabStopDistance(self.options_edit.fontMetrics().horizontalAdvance(' ') * 4)
-        with silent_operation("set_options_edit_style"):
-            self.options_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
-            with silent_operation("set_options_accept_rich_text"):
-                self.options_edit.setAcceptRichText(False)
+        self.options_edit.setTabStopDistance(self.options_edit.fontMetrics().horizontalAdvance(' ') * 4)
+        self.options_edit.setStyleSheet("background-color: #2b2b2b; color: #eaeaea;")
+        self.options_edit.setAcceptRichText(False)
 
         # Option localisations UI: allow adding multiple option keys with
         # localized text. These are stored on the Event as
@@ -1345,16 +1405,13 @@ class EventEditDialog(EditorDialogBase):
         export_tab = QWidget()
         export_layout = QVBoxLayout()
         self.export_text = QTextEdit()
-        with silent_operation("set_export_text_mono_font_event"):
-            mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-            self.export_text.setFont(mono)
-        with silent_operation("set_export_text_style_event"):
-            # Render tabs visually as 4 spaces for tighter preview layout
-            with silent_operation("set_export_tab_stop_event"):
-                self.export_text.setTabStopDistance(self.export_text.fontMetrics().horizontalAdvance(' ') * 4)
-            self.export_text.setReadOnly(True)
-            self.export_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-            self.export_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc;")
+        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self.export_text.setFont(mono)
+        # Render tabs visually as 4 spaces for tighter preview layout
+        self.export_text.setTabStopDistance(self.export_text.fontMetrics().horizontalAdvance(' ') * 4)
+        self.export_text.setReadOnly(True)
+        self.export_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.export_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc;")
         export_layout.addWidget(QLabel("Export preview (HOI4 event code for this event):"))
         export_layout.addWidget(self.export_text)
         export_tab.setLayout(export_layout)
@@ -1367,81 +1424,71 @@ class EventEditDialog(EditorDialogBase):
         layout.addWidget(btns)
         self.setLayout(layout)
         # connect live-update signals for export preview and apply changes live
-        with silent_operation("connect_event_live_update_signals"):
-            self.id_edit.textChanged.connect(self._update_export_preview)
-            self.title_edit.textChanged.connect(self._update_export_preview)
-            self.desc_edit.textChanged.connect(self._update_export_preview)
-            self.trigger_edit.textChanged.connect(self._update_export_preview)
-            self.options_edit.textChanged.connect(self._update_export_preview)
+        self.id_edit.textChanged.connect(self._update_export_preview)
+        self.title_edit.textChanged.connect(self._update_export_preview)
+        self.desc_edit.textChanged.connect(self._update_export_preview)
+        self.trigger_edit.textChanged.connect(self._update_export_preview)
+        self.options_edit.textChanged.connect(self._update_export_preview)
 
-            def _maybe_refresh_canvas():
-                with silent_operation("maybe_refresh_canvas_event"):
-                    parent = self.parent() if hasattr(self, 'parent') else None
-                    canvas = getattr(parent, 'canvas', None) if parent is not None else None
-                    if canvas and hasattr(canvas, 'schedule_frame_update'):
-                        canvas.schedule_frame_update()
+        def _maybe_refresh_canvas():
+            parent = self.parent() if hasattr(self, 'parent') else None
+            canvas = getattr(parent, 'canvas', None) if parent is not None else None
+            if canvas and hasattr(canvas, 'schedule_frame_update'):
+                canvas.schedule_frame_update()
 
-            def _apply_id(v):
-                with silent_operation("apply_event_id"):
-                    self.event.id = v.strip()
-                    _maybe_refresh_canvas()
-            def _apply_title(v):
-                with silent_operation("apply_event_title"):
-                    self.event.title = v
-                    _maybe_refresh_canvas()
-            def _apply_desc():
-                with silent_operation("apply_event_desc"):
-                    self.event.description = self.desc_edit.toPlainText()
-                    _maybe_refresh_canvas()
-            def _apply_trigger():
-                with silent_operation("apply_event_trigger"):
-                    self.event.trigger = self.trigger_edit.toPlainText()
-                    _maybe_refresh_canvas()
-            def _apply_options():
-                with silent_operation("apply_event_options"):
-                    self.event.options_block = self.options_edit.toPlainText()
-                    _maybe_refresh_canvas()
+        def _apply_id(v):
+            self.event.id = v.strip()
+            _maybe_refresh_canvas()
+        def _apply_title(v):
+            self.event.title = v
+            _maybe_refresh_canvas()
+        def _apply_desc():
+            self.event.description = self.desc_edit.toPlainText()
+            _maybe_refresh_canvas()
+        def _apply_trigger():
+            self.event.trigger = self.trigger_edit.toPlainText()
+            _maybe_refresh_canvas()
+        def _apply_options():
+            self.event.options_block = self.options_edit.toPlainText()
+            _maybe_refresh_canvas()
 
-            self.id_edit.textChanged.connect(_apply_id)
-            self.title_edit.textChanged.connect(_apply_title)
-            self.desc_edit.textChanged.connect(lambda *_: _apply_desc())
-            self.trigger_edit.textChanged.connect(lambda *_: _apply_trigger())
-            self.options_edit.textChanged.connect(lambda *_: _apply_options())
+        self.id_edit.textChanged.connect(_apply_id)
+        self.title_edit.textChanged.connect(_apply_title)
+        self.desc_edit.textChanged.connect(lambda *_: _apply_desc())
+        self.trigger_edit.textChanged.connect(lambda *_: _apply_trigger())
+        self.options_edit.textChanged.connect(lambda *_: _apply_options())
 
-            # initial render
-            self._update_export_preview()
+        # initial render
+        self._update_export_preview()
 
     def accept(self):
-        with silent_operation("accept_event_dialog"):
-            old_id = self.event.id
-            self.event.id = self.id_edit.text().strip() or old_id
-            self.event.title = self.title_edit.text().strip()
-            self.event.description = self.desc_edit.toPlainText()
-            self.event.trigger = self.trigger_edit.toPlainText()
-            self.event.options_block = self.options_edit.toPlainText()
+        old_id = self.event.id
+        self.event.id = self.id_edit.text().strip() or old_id
+        self.event.title = self.title_edit.text().strip()
+        self.event.description = self.desc_edit.toPlainText()
+        self.event.trigger = self.trigger_edit.toPlainText()
+        self.event.options_block = self.options_edit.toPlainText()
         super().accept()
 
     def _format_event_export(self) -> str:
-        with silent_operation("format_event_export"):
-            # Build a temporary Event from current fields
-            tmp = Event(
-                id=self.id_edit.text().strip() or getattr(self.event, 'id', ''),
-                title=self.title_edit.text().strip(),
-                description=self.desc_edit.toPlainText(),
-                x=int(getattr(self.event, 'x', 0) or 0),
-                y=int(getattr(self.event, 'y', 0) or 0),
-                trigger=self.trigger_edit.toPlainText(),
-                options_block=self.options_edit.toPlainText(),
-            )
-            parent = self.parent() if hasattr(self, 'parent') else None
-            if parent is not None and hasattr(parent, 'format_event_block'):
-                return str(parent.format_event_block(tmp) or '')
+        # Build a temporary Event from current fields
+        tmp = Event(
+            id=self.id_edit.text().strip() or getattr(self.event, 'id', ''),
+            title=self.title_edit.text().strip(),
+            description=self.desc_edit.toPlainText(),
+            x=int(getattr(self.event, 'x', 0) or 0),
+            y=int(getattr(self.event, 'y', 0) or 0),
+            trigger=self.trigger_edit.toPlainText(),
+            options_block=self.options_edit.toPlainText(),
+        )
+        parent = self.parent() if hasattr(self, 'parent') else None
+        if parent is not None and hasattr(parent, 'format_event_block'):
+            return str(parent.format_event_block(tmp) or '')
         return ""
 
     def _update_export_preview(self) -> None:
-        with silent_operation("update_export_preview_event"):
-            txt = self._format_event_export()
-            self.export_text.setPlainText(txt)
+        txt = self._format_event_export()
+        self.export_text.setPlainText(txt)
 
 
 class LayerManagerDialog(EditorDialogBase):
@@ -1510,8 +1557,7 @@ class ProjectsHomeDialog(EditorDialogBase):
         layout = QVBoxLayout()
         top = QHBoxLayout()
         # show obfuscated path in the UI but keep real path in self.start_dir
-        with silent_operation("projects_home_import_lru_cache"):
-            from functools import lru_cache
+        from functools import lru_cache
         self.dir_edit = QLineEdit(obfuscate_user_in_path(self.start_dir) if 'obfuscate_user_in_path' in globals() else self.start_dir)
         self.dir_edit.setReadOnly(True)
         browse = QPushButton("Browse…")
@@ -1524,8 +1570,7 @@ class ProjectsHomeDialog(EditorDialogBase):
                 # display obfuscated/shortened and set tooltip to full path
                 if 'obfuscate_user_in_path' in globals():
                     self.dir_edit.setText(obfuscate_user_in_path(fn))
-                    with silent_operation("projects_home_set_tooltip"):
-                        self.dir_edit.setToolTip(fn)
+                    self.dir_edit.setToolTip(fn)
                 else:
                     set_widget_path_display(self.dir_edit, fn)
                 self.refresh()
@@ -1538,109 +1583,90 @@ class ProjectsHomeDialog(EditorDialogBase):
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         # Double-click a project to open it immediately
-        with silent_operation("projects_home_double_click_connect"):
-            self.list.itemDoubleClicked.connect(lambda item: (setattr(self, 'selected_path', item.data(Qt.ItemDataRole.UserRole)) or self.accept()))
+        self.list.itemDoubleClicked.connect(lambda item: (setattr(self, 'selected_path', item.data(Qt.ItemDataRole.UserRole)) or self.accept()))
         layout.addWidget(self.list)
 
         # Per-project preference: when set, new/loaded projects will prefer app-wide settings
-        with silent_operation("projects_home_setup_preference_checkbox"):
-            self.prefer_app_settings_chk = QCheckBox('Prefer app-wide settings over per-project (for new projects)')
-            # default unchecked; the main window may override when opening a project
-            self.prefer_app_settings_chk.setChecked(False)
-            layout.addWidget(self.prefer_app_settings_chk)
-            # Persist the preference when toggled: if a project is selected, write it into
-            # that project's JSON under settings.preferences.prefer_app_settings. If no
-            # project is selected, update the main window settings (if available).
-            def _on_prefer_toggled(checked: bool):
-                with silent_operation("projects_home_prefer_toggled"):
-                    # If an item is selected, prefer to persist to that project's file
-                    it = self.list.currentItem()
-                    if it:
-                        p = it.data(Qt.ItemDataRole.UserRole)
-                        if p and os.path.isfile(p):
-                            pdata = None
-                            with silent_operation("projects_home_load_project_json"):
-                                with open(p, 'r', encoding='utf-8') as f:
-                                    pdata = json.load(f)
-                            if isinstance(pdata, dict):
-                                with silent_operation("projects_home_persist_preference"):
-                                    settings = pdata.get('settings') or {}
-                                    prefs = settings.get('preferences') or {}
-                                    prefs['prefer_app_settings'] = bool(checked)
-                                    settings['preferences'] = prefs
-                                    pdata['settings'] = settings
-                                    # write back
-                                    with open(p, 'w', encoding='utf-8') as f:
-                                        json.dump(pdata, f, indent=2)
-                                    # update label to reflect persistence (size may change)
-                                    st = 0
-                                    with silent_operation("projects_home_get_file_size"):
-                                        st = os.path.getsize(p)
-                                    # Recompute counts for label: total nodes and per-type breakdown
-                                    _focus_ct = len(pdata.get('focuses', []) or []) if isinstance(pdata, dict) else 0
-                                    _event_ct = len(pdata.get('events', []) or []) if isinstance(pdata, dict) else 0
-                                    _note_ct = len(pdata.get('notes', []) or []) if isinstance(pdata, dict) else 0
-                                    _total_ct = _focus_ct + _event_ct + _note_ct
-                                    label = (
-                                        f"{os.path.basename(p)}  —  total {_total_ct}  "
-                                        f"(notes: {_note_ct}, focuses: {_focus_ct}, events: {_event_ct})  —  {format_project_file_size(st, show_bytes=False)}"
-                                    )
-                                    it.setText(label)
-                                    # If parent exists and is main window, update its in-memory flag
-                                    with silent_operation("projects_home_update_parent_flag"):
-                                        mw = self.parent()
-                                        if getattr(mw, 'prefer_app_settings', None) is not None:
-                                            mw.prefer_app_settings = bool(checked)
+        self.prefer_app_settings_chk = QCheckBox('Prefer app-wide settings over per-project (for new projects)')
+        # default unchecked; the main window may override when opening a project
+        self.prefer_app_settings_chk.setChecked(False)
+        layout.addWidget(self.prefer_app_settings_chk)
+        # Persist the preference when toggled: if a project is selected, write it into
+        # that project's JSON under settings.preferences.prefer_app_settings. If no
+        # project is selected, update the main window settings (if available).
+        def _on_prefer_toggled(checked: bool):
+            # If an item is selected, prefer to persist to that project's file
+            it = self.list.currentItem()
+            if it:
+                p = it.data(Qt.ItemDataRole.UserRole)
+                if p and os.path.isfile(p):
+                    summary = None
+                    with silent_operation("projects_home_persist_preference"):
+                        # Goes through the document layer: load + validate
+                        # + migrate, then an atomic write-back.
+                        summary = set_editor_preference(
+                            p, 'prefer_app_settings', bool(checked),
+                            app_version=getattr(self.parent(), 'app_version', '') or '')
+                    if summary is not None:
+                        with silent_operation("projects_home_update_label"):
+                            st = 0
+                            with silent_operation("projects_home_get_file_size"):
+                                st = os.path.getsize(p)
+                            _total_ct = summary.focus_count + summary.event_count + summary.note_count
+                            label = (
+                                f"{os.path.basename(p)}  -  total {_total_ct}  "
+                                f"(notes: {summary.note_count}, focuses: {summary.focus_count}, events: {summary.event_count})  -  {format_project_file_size(st, show_bytes=False)}"
+                            )
+                            it.setText(label)
+                            # If parent exists and is main window, update its in-memory flag
+                            with silent_operation("projects_home_update_parent_flag"):
+                                mw = self.parent()
+                                if getattr(mw, 'prefer_app_settings', None) is not None:
+                                    mw.prefer_app_settings = bool(checked)
+            else:
+                # No project selected: update main window settings so subsequent saves persist
+                with silent_operation("projects_home_update_main_window_settings"):
+                    mw = self.parent()
+                    if mw is not None and hasattr(mw, 'prefer_app_settings'):
+                        mw.prefer_app_settings = bool(checked)
+                        with silent_operation("projects_home_save_settings"):
+                            if hasattr(mw, 'save_settings'):
+                                mw.save_settings()
+        self.prefer_app_settings_chk.toggled.connect(_on_prefer_toggled)
+        # When the selection in the projects list changes, update the checkbox to
+        # reflect the stored preference for that project (or the main window's
+        # in-memory value when no project selected). Block signals while updating
+        # so we don't accidentally persist again.
+        def _on_selection_changed():
+            it = self.list.currentItem()
+            # Block signals to avoid re-triggering the persistence handler
+            with silent_operation("projects_home_block_signals"):
+                self.prefer_app_settings_chk.blockSignals(True)
+            if not it:
+                # No project selected: reflect main window's in-memory value
+                with silent_operation("projects_home_reflect_main_window_value"):
+                    mw = self.parent()
+                    if mw is not None and hasattr(mw, 'prefer_app_settings'):
+                        self.prefer_app_settings_chk.setChecked(bool(getattr(mw, 'prefer_app_settings', False)))
                     else:
-                        # No project selected: update main window settings so subsequent saves persist
-                        with silent_operation("projects_home_update_main_window_settings"):
-                            mw = self.parent()
-                            if mw is not None and hasattr(mw, 'prefer_app_settings'):
-                                mw.prefer_app_settings = bool(checked)
-                                with silent_operation("projects_home_save_settings"):
-                                    if hasattr(mw, 'save_settings'):
-                                        mw.save_settings()
-            with silent_operation("projects_home_connect_toggled"):
-                self.prefer_app_settings_chk.toggled.connect(_on_prefer_toggled)
-            # When the selection in the projects list changes, update the checkbox to
-            # reflect the stored preference for that project (or the main window's
-            # in-memory value when no project selected). Block signals while updating
-            # so we don't accidentally persist again.
-            def _on_selection_changed():
-                with silent_operation("projects_home_selection_changed"):
-                    it = self.list.currentItem()
-                    # Block signals to avoid re-triggering the persistence handler
-                    with silent_operation("projects_home_block_signals"):
-                        self.prefer_app_settings_chk.blockSignals(True)
-                    if not it:
-                        # No project selected: reflect main window's in-memory value
-                        with silent_operation("projects_home_reflect_main_window_value"):
-                            mw = self.parent()
-                            if mw is not None and hasattr(mw, 'prefer_app_settings'):
-                                self.prefer_app_settings_chk.setChecked(bool(getattr(mw, 'prefer_app_settings', False)))
-                            else:
-                                self.prefer_app_settings_chk.setChecked(False)
-                    else:
-                        p = it.data(Qt.ItemDataRole.UserRole)
-                        val = False
-                        if p and os.path.isfile(p):
-                            with silent_operation("projects_home_read_project_preference"):
-                                with open(p, 'r', encoding='utf-8') as f:
-                                    pdata = json.load(f)
-                                if isinstance(pdata, dict):
-                                    settings = pdata.get('settings') or {}
-                                    prefs = settings.get('preferences') or {}
-                                    val = bool(prefs.get('prefer_app_settings', False))
-                        with silent_operation("projects_home_set_checkbox_value"):
-                            self.prefer_app_settings_chk.setChecked(bool(val))
-                    with silent_operation("projects_home_unblock_signals"):
-                        self.prefer_app_settings_chk.blockSignals(False)
+                        self.prefer_app_settings_chk.setChecked(False)
+            else:
+                p = it.data(Qt.ItemDataRole.UserRole)
+                val = False
+                if p and os.path.isfile(p):
+                    with silent_operation("projects_home_read_project_preference"):
+                        summary = read_summary(p)
+                        if summary is not None:
+                            val = bool(summary.prefer_app_settings)
+                with silent_operation("projects_home_set_checkbox_value"):
+                    self.prefer_app_settings_chk.setChecked(bool(val))
+            with silent_operation("projects_home_unblock_signals"):
+                self.prefer_app_settings_chk.blockSignals(False)
 
-            with silent_operation("projects_home_connect_selection_changed"):
-                # connect selection changes to updater
-                self.list.itemSelectionChanged.connect(_on_selection_changed)
-                # initialize checkbox state now that list is populated
-                _on_selection_changed()
+        # connect selection changes to updater
+        self.list.itemSelectionChanged.connect(_on_selection_changed)
+        # initialize checkbox state now that list is populated
+        _on_selection_changed()
 
         btns = QHBoxLayout()
         load_btn = QPushButton("Load")
@@ -1662,37 +1688,28 @@ class ProjectsHomeDialog(EditorDialogBase):
     def refresh(self):
         folder = self.start_dir or os.getcwd()
         self.list.clear()
-        with silent_operation("projects_home_refresh_list"):
-            for fn in sorted(os.listdir(folder)):
-                if not fn.lower().endswith('.json'):
-                    continue
-                path = os.path.join(folder, fn)
-                # Only list files that look like valid project JSONs (contain a 'focuses' list)
-                is_project = False
-                focus_count = 0
-                event_count = 0
-                note_count = 0
-                with silent_operation("projects_home_check_project_file"):
-                    with open(path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    if isinstance(data, dict) and isinstance(data.get('focuses', None), list):
-                        is_project = True
-                        focus_count = len(data.get('focuses') or [])
-                        event_count = len(data.get('events') or []) if isinstance(data.get('events', None), list) else 0
-                        note_count = len(data.get('notes') or []) if isinstance(data.get('notes', None), list) else 0
-                if not is_project:
-                    continue
-                st = 0
-                with silent_operation("projects_home_get_size"):
-                    st = os.path.getsize(path)
-                total = focus_count + event_count + note_count
-                label = (
-                    f"{fn}  —  total {total}  "
-                    f"(notes: {note_count}, focuses: {focus_count}, events: {event_count})  —  {format_project_file_size(st, show_bytes=True)}"
-                )
-                itm = QListWidgetItem(label)
-                itm.setData(Qt.ItemDataRole.UserRole, path)
-                self.list.addItem(itm)
+        for fn in sorted(os.listdir(folder)):
+            if not fn.lower().endswith('.json'):
+                continue
+            path = os.path.join(folder, fn)
+            # Only list files that load as a project in any known format.
+            summary = None
+            summary = read_summary(path)
+            if summary is None:
+                continue
+            focus_count = summary.focus_count
+            event_count = summary.event_count
+            note_count = summary.note_count
+            st = 0
+            st = os.path.getsize(path)
+            total = focus_count + event_count + note_count
+            label = (
+                f"{fn}  -  total {total}  "
+                f"(notes: {note_count}, focuses: {focus_count}, events: {event_count})  -  {format_project_file_size(st, show_bytes=True)}"
+            )
+            itm = QListWidgetItem(label)
+            itm.setData(Qt.ItemDataRole.UserRole, path)
+            self.list.addItem(itm)
 
     def _do_load(self):
         it = self.list.currentItem()
@@ -1737,21 +1754,12 @@ class ProjectsHomeDialog(EditorDialogBase):
             prefer = bool(getattr(self, 'prefer_app_settings_chk', None) and self.prefer_app_settings_chk.isChecked())
         except Exception:
             prefer = False
-        base = {
-            'version': getattr(self.parent(), 'app_version', '1.0.9') if self.parent() else '1.0.9',
-            'tree_id': name.strip(),
-            'country_tag': tag,
-            'focuses': [],
-            'library': {},
-            'settings': {
-                'preferences': {
-                    'prefer_app_settings': bool(prefer)
-                }
-            }
-        }
         try:
-            with open(fn, 'w', encoding='utf-8') as f:
-                json.dump(base, f, indent=2)
+            document = new_document(name.strip(), country_tag=tag,
+                                    prefer_app_settings=bool(prefer))
+            save_document(fn, document,
+                          app_version=(getattr(self.parent(), 'app_version', '') or ''),
+                          backups=False)
             self.selected_path = fn
             self.accept()
         except Exception as e:
@@ -1853,36 +1861,31 @@ class IconLibraryDialog(EditorDialogBase):
         rem_btn.clicked.connect(self._remove)
         self.setLayout(v)
         # Populate the list initially
-        with silent_operation("icon_library_initial_refresh"):
-            self._refresh()
+        self._refresh()
 
     def accept(self) -> None:
         """Apply advanced settings (file logging) when the dialog is accepted."""
         # Apply file logging choice if the dialog was created with a canvas that has logging controls
-        with silent_operation("icon_library_apply_file_logging"):
-            parent = getattr(self.canvas, 'parent', None)
-            if parent is not None and hasattr(self, 'file_logging_chk') and hasattr(self, 'log_path_edit'):
-                to_file = bool(self.file_logging_chk.isChecked())
-                # update path if user changed it
-                lp = str(self.log_path_edit.text()).strip() or None
-                if lp:
-                    parent.log_file_path = lp
-                # ensure main has attributes
-                parent.logging_to_file = to_file
-                parent.setup_file_logging(to_file, lp)
+        parent = getattr(self.canvas, 'parent', None)
+        if parent is not None and hasattr(self, 'file_logging_chk') and hasattr(self, 'log_path_edit'):
+            to_file = bool(self.file_logging_chk.isChecked())
+            # update path if user changed it
+            lp = str(self.log_path_edit.text()).strip() or None
+            if lp:
+                parent.log_file_path = lp
+            # ensure main has attributes
+            parent.logging_to_file = to_file
+            parent.setup_file_logging(to_file, lp)
 
         # Persist icon library changes to any top-level window that owns the same dict
-        with silent_operation("icon_library_persist_to_top_level"):
-            from PyQt6.QtWidgets import QApplication
-            for w in QApplication.topLevelWidgets():
-                with silent_operation("icon_library_save_widget_database"):
-                    if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
-                        w.save_database()
+        from PyQt6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
+                w.save_database()
         # Also attempt direct parent save for reliability
-        with silent_operation("icon_library_persist_to_parent"):
-            p = self.parent()
-            if p is not None and hasattr(p, 'save_database'):
-                p.save_database()
+        p = self.parent()
+        if p is not None and hasattr(p, 'save_database'):
+            p.save_database()
 
         # Finalize the dialog acceptance
         return super().accept()
@@ -1898,42 +1901,37 @@ class IconLibraryDialog(EditorDialogBase):
         # Limit batch size to avoid accidentally adding huge numbers of icons
         MAX_BATCH = 64
         if len(fns) > MAX_BATCH:
-            with silent_operation("icon_library_batch_limit_message"):
-                QMessageBox.information(self, "Icon Library", f"Selected {len(fns)} icons. Importing the first {MAX_BATCH}.")
+            QMessageBox.information(self, "Icon Library", f"Selected {len(fns)} icons. Importing the first {MAX_BATCH}.")
             fns = fns[:MAX_BATCH]
         added = 0
         for fn in fns:
-            with silent_operation("icon_library_add_single_icon"):
-                if not fn:
-                    continue
-                if not self._valid_icon_file(fn):
-                    continue
-                name = os.path.splitext(os.path.basename(fn))[0]
-                # ensure unique key
-                key = name
-                i = 1
-                while key in self.icons:
-                    key = f"{name}_{i}"
-                    i += 1
-                self.icons[key] = fn
-                added += 1
+            if not fn:
+                continue
+            if not self._valid_icon_file(fn):
+                continue
+            name = os.path.splitext(os.path.basename(fn))[0]
+            # ensure unique key
+            key = name
+            i = 1
+            while key in self.icons:
+                key = f"{name}_{i}"
+                i += 1
+            self.icons[key] = fn
+            added += 1
         if added == 0:
             QMessageBox.information(self, "Icon Library", "No valid icons were added.")
             return
         # refresh UI once for the batch
         self._refresh()
         # Persist changes to any top-level owner that shares this dict (do once)
-        with silent_operation("icon_library_add_persist_to_top_level"):
-            from PyQt6.QtWidgets import QApplication
-            for w in QApplication.topLevelWidgets():
-                with silent_operation("icon_library_add_save_widget_database"):
-                    if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
-                        w.save_database()
+        from PyQt6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
+                w.save_database()
         # Also attempt direct parent save for reliability
-        with silent_operation("icon_library_add_persist_to_parent"):
-            p = self.parent()
-            if p is not None and hasattr(p, 'save_database'):
-                p.save_database()
+        p = self.parent()
+        if p is not None and hasattr(p, 'save_database'):
+            p.save_database()
 
     def _remove(self):
         it = self.list.currentItem()
@@ -1944,12 +1942,10 @@ class IconLibraryDialog(EditorDialogBase):
             del self.icons[key]
         self._refresh()
         # Persist changes to any top-level owner that shares this dict
-        with silent_operation("icon_library_remove_persist_to_top_level"):
-            from PyQt6.QtWidgets import QApplication
-            for w in QApplication.topLevelWidgets():
-                with silent_operation("icon_library_remove_save_widget_database"):
-                    if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
-                        w.save_database()
+        from PyQt6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            if getattr(w, 'icon_library', None) is self.icons and hasattr(w, 'save_database'):
+                w.save_database()
 
     def _refresh(self):
         q = (self.search.text() or '').strip().lower()
@@ -1957,7 +1953,7 @@ class IconLibraryDialog(EditorDialogBase):
         for k, v in sorted(self.icons.items()):
             if q and q not in k.lower() and q not in str(v).lower():
                 continue
-            item = QListWidgetItem(f"{k} — {os.path.basename(str(v))}")
+            item = QListWidgetItem(f"{k} - {os.path.basename(str(v))}")
             item.setData(Qt.ItemDataRole.UserRole, k)
             self.list.addItem(item)
 
@@ -1976,9 +1972,8 @@ class SettingsDialog(EditorDialogBase):
         super().__init__(parent, title=title, modal=modal)
         self.canvas = canvas
         # Mark dialog for scoped stylesheet targeting and apply appearance stylesheet
-        with silent_operation("settings_dialog_set_stylesheet"):
-            self.setObjectName('settings_dialog')
-            self.setStyleSheet("""
+        self.setObjectName('settings_dialog')
+        self.setStyleSheet("""
 #settings_dialog QWidget#appearance_container { background-color: #4B4B4B; }
 #settings_dialog QLabel, #settings_dialog QToolButton, #settings_dialog QCheckBox { color: #e0e0e0; }
 #settings_dialog QLineEdit, #settings_dialog QComboBox, #settings_dialog QSpinBox, #settings_dialog QDoubleSpinBox {
@@ -2128,7 +2123,7 @@ class SettingsDialog(EditorDialogBase):
 
         # --- General tab ---
         gen_w = QWidget(); gen_l = QFormLayout()
-        # Tree ID (app-level) — parent window stores this
+        # Tree ID (app-level) - parent window stores this
         self.tree_id_edit = QLineEdit(getattr(self.canvas.parent, 'tree_id', ''))
         self.tree_id_edit.editingFinished.connect(self._on_tree_id)
         gen_l.addRow('Tree ID:', self.tree_id_edit)
@@ -2146,15 +2141,13 @@ class SettingsDialog(EditorDialogBase):
             real_start = getattr(self.canvas.parent, 'app_base_dir', '') or os.getcwd()
             fn = QFileDialog.getExistingDirectory(self, 'Choose Application Base Folder', real_start)
             if fn:
-                with silent_operation("settings_change_app_base"):
-                    self.canvas.parent.app_base_dir = fn
-                    ok = True
-                    with silent_operation("settings_ensure_app_dirs"):
-                        ok = self.canvas.parent.ensure_app_dirs()
-                    if ok:
-                        self.app_base_edit.setText(self._obfuscate_user_in_path(fn))
-                    else:
-                        QMessageBox.warning(self, 'Invalid Folder', 'Failed to prepare folders for the selected base directory.')
+                self.canvas.parent.app_base_dir = fn
+                ok = True
+                ok = self.canvas.parent.ensure_app_dirs()
+                if ok:
+                    self.app_base_edit.setText(self._obfuscate_user_in_path(fn))
+                else:
+                    QMessageBox.warning(self, 'Invalid Folder', 'Failed to prepare folders for the selected base directory.')
         base_btn.clicked.connect(_change_app_base)
         base_h.addWidget(self.app_base_edit); base_h.addWidget(base_btn)
         gen_l.addRow('Application Base folder:', base_h)
@@ -2197,16 +2190,13 @@ class SettingsDialog(EditorDialogBase):
             real_start = getattr(self.canvas.parent, 'icon_library_path', '') or os.getcwd()
             fn = QFileDialog.getExistingDirectory(self, 'Choose Icon Library Folder', real_start)
             if fn:
-                with silent_operation("settings_change_icon_library"):
-                    self.canvas.parent.icon_library_path = fn
-                    self.icon_library_path_edit.setText(self._obfuscate_user_in_path(fn))
-                    # trigger a rescan of icon library on the main window
-                    with silent_operation("settings_scan_icon_library"):
-                        self.canvas.parent.scan_icon_library()
-                    # Persist immediately if preferring app-wide settings
-                    with silent_operation("settings_save_after_icon_library"):
-                        if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                            self.canvas.parent.save_settings()
+                self.canvas.parent.icon_library_path = fn
+                self.icon_library_path_edit.setText(self._obfuscate_user_in_path(fn))
+                # trigger a rescan of icon library on the main window
+                self.canvas.parent.scan_icon_library()
+                # Persist immediately if preferring app-wide settings
+                if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                    self.canvas.parent.save_settings()
         icon_path_btn.clicked.connect(_change_icon_library_path)
         icon_path_h.addWidget(self.icon_library_path_edit); icon_path_h.addWidget(icon_path_btn)
         gen_l.addRow('Icon Library folder:', icon_path_h)
@@ -2226,12 +2216,10 @@ class SettingsDialog(EditorDialogBase):
                 real_start = os.path.join(abd, 'projects') if abd else os.getcwd()
             fn = QFileDialog.getExistingDirectory(self, 'Choose Projects Home Folder', real_start)
             if fn:
-                with silent_operation("settings_change_projects_home"):
-                    self.canvas.parent.projects_home_path = fn
-                    self.projects_home_path_edit.setText(self._obfuscate_user_in_path(fn))
-                    with silent_operation("settings_save_after_projects_home"):
-                        if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                            self.canvas.parent.save_settings()
+                self.canvas.parent.projects_home_path = fn
+                self.projects_home_path_edit.setText(self._obfuscate_user_in_path(fn))
+                if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                    self.canvas.parent.save_settings()
         proj_path_btn.clicked.connect(_change_projects_home_path)
         proj_path_h.addWidget(self.projects_home_path_edit); proj_path_h.addWidget(proj_path_btn)
         gen_l.addRow('Projects Home folder:', proj_path_h)
@@ -2241,44 +2229,38 @@ class SettingsDialog(EditorDialogBase):
         self.logging_enabled_chk = QCheckBox('Enable logging to console')
         self.logging_enabled_chk.setChecked(bool(getattr(self.canvas.parent, 'logging_enabled', False)))
         def _on_logging_toggled(chk):
-            with silent_operation("settings_logging_toggled"):
-                en = bool(chk)
-                self.canvas.parent.logging_enabled = en
-                lvl = getattr(self.canvas.parent, 'logging_level', 'INFO')
-                level_val = getattr(logging, str(lvl).upper(), logging.INFO)
-                if en:
-                    logger.setLevel(level_val)
-                    if not logger.handlers:
-                        h = logging.StreamHandler()
-                        h.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
-                        logger.addHandler(h)
-                else:
-                    # remove handlers to silence logger (keep level)
-                    for h in list(logger.handlers):
-                        with silent_operation("settings_remove_logger_handler"):
-                            logger.removeHandler(h)
-                # Persist immediately if preferring app-wide settings
-                with silent_operation("settings_save_after_logging_toggle"):
-                    if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            en = bool(chk)
+            self.canvas.parent.logging_enabled = en
+            lvl = getattr(self.canvas.parent, 'logging_level', 'INFO')
+            level_val = getattr(logging, str(lvl).upper(), logging.INFO)
+            if en:
+                logger.setLevel(level_val)
+                if not logger.handlers:
+                    h = logging.StreamHandler()
+                    h.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+                    logger.addHandler(h)
+            else:
+                # remove handlers to silence logger (keep level)
+                for h in list(logger.handlers):
+                    logger.removeHandler(h)
+            # Persist immediately if preferring app-wide settings
+            if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
         self.logging_enabled_chk.toggled.connect(_on_logging_toggled)
         self.logging_level_combo = QComboBox()
         self.logging_level_combo.addItems(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
-        with silent_operation("settings_init_logging_level_combo"):
-            cur = getattr(self.canvas.parent, 'logging_level', 'INFO')
-            idx = self.logging_level_combo.findText(str(cur).upper())
-            if idx >= 0:
-                self.logging_level_combo.setCurrentIndex(idx)
+        cur = getattr(self.canvas.parent, 'logging_level', 'INFO')
+        idx = self.logging_level_combo.findText(str(cur).upper())
+        if idx >= 0:
+            self.logging_level_combo.setCurrentIndex(idx)
         def _on_log_level_changed(idx):
-            with silent_operation("settings_log_level_changed"):
-                lvl = self.logging_level_combo.currentText()
-                self.canvas.parent.logging_level = lvl
-                if getattr(self.canvas.parent, 'logging_enabled', False):
-                    level_val = getattr(logging, lvl.upper(), logging.INFO)
-                    logger.setLevel(level_val)
-                with silent_operation("settings_save_after_log_level"):
-                    if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            lvl = self.logging_level_combo.currentText()
+            self.canvas.parent.logging_level = lvl
+            if getattr(self.canvas.parent, 'logging_enabled', False):
+                level_val = getattr(logging, lvl.upper(), logging.INFO)
+                logger.setLevel(level_val)
+            if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
         self.logging_level_combo.currentIndexChanged.connect(_on_log_level_changed)
         log_h.addWidget(self.logging_enabled_chk)
         log_h.addWidget(QLabel('Level:'))
@@ -2302,12 +2284,11 @@ class SettingsDialog(EditorDialogBase):
         self.autosave_rotate_spin = QSpinBox(); self.autosave_rotate_spin.setRange(2, 100)
         self.autosave_rotate_spin.setValue(int(getattr(self.canvas.parent, 'autosave_rotate_count', 6)))
         # Reflect mutual exclusivity initially
-        with silent_operation("settings_autosave_mutual_exclusivity"):
-            if bool(getattr(self.canvas.parent, 'autosave_overwrite', True)):
-                self.autosave_rotate_chk.setChecked(False)
-            if bool(getattr(self.canvas.parent, 'autosave_rotate', False)):
-                self.autosave_overwrite_chk.setChecked(False)
-            self.autosave_rotate_spin.setEnabled(bool(getattr(self.canvas.parent, 'autosave_rotate', False)))
+        if bool(getattr(self.canvas.parent, 'autosave_overwrite', True)):
+            self.autosave_rotate_chk.setChecked(False)
+        if bool(getattr(self.canvas.parent, 'autosave_rotate', False)):
+            self.autosave_overwrite_chk.setChecked(False)
+        self.autosave_rotate_spin.setEnabled(bool(getattr(self.canvas.parent, 'autosave_rotate', False)))
 
         autosave_layout.addRow(self.autosave_chk)
         autosave_layout.addRow('Interval:', autosave_interval_h)
@@ -2316,74 +2297,59 @@ class SettingsDialog(EditorDialogBase):
         autosave_layout.addRow(rotate_h)
 
         def _on_autosave_toggled(chk):
-            with silent_operation("settings_autosave_toggled"):
-                self.canvas.parent.autosave_enabled = bool(chk)
-                if self.canvas.parent.autosave_enabled:
-                    self.canvas.parent._start_autosave_timer()
-                else:
-                    self.canvas.parent._stop_autosave_timer()
-                # Persist autosave preference immediately
-                with silent_operation("settings_save_after_autosave_toggle"):
-                    if hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            self.canvas.parent.autosave_enabled = bool(chk)
+            if self.canvas.parent.autosave_enabled:
+                self.canvas.parent._start_autosave_timer()
+            else:
+                self.canvas.parent._stop_autosave_timer()
+            # Persist autosave preference immediately
+            if hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
 
         def _on_autosave_interval(v):
-            with silent_operation("settings_autosave_interval_changed"):
-                self.canvas.parent.autosave_interval_min = int(v)
-                if getattr(self.canvas.parent, 'autosave_enabled', False):
-                    self.canvas.parent._start_autosave_timer()
-                with silent_operation("settings_save_after_autosave_interval"):
-                    if hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            self.canvas.parent.autosave_interval_min = int(v)
+            if getattr(self.canvas.parent, 'autosave_enabled', False):
+                self.canvas.parent._start_autosave_timer()
+            if hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
 
         def _on_autosave_overwrite(chk):
-            with silent_operation("settings_autosave_overwrite"):
-                self.canvas.parent.autosave_overwrite = bool(chk)
-                # enforce exclusivity: turning on overwrite disables rotate
-                if self.canvas.parent.autosave_overwrite:
-                    self.canvas.parent.autosave_rotate = False
-                    self.autosave_rotate_chk.blockSignals(True)
-                    self.autosave_rotate_chk.setChecked(False)
-                    with silent_operation("settings_autosave_unblock_rotate"):
-                        self.autosave_rotate_chk.blockSignals(False)
-                # update rotate count enablement
-                with silent_operation("settings_autosave_update_rotate_spin"):
-                    self.autosave_rotate_spin.setEnabled(bool(self.canvas.parent.autosave_rotate))
-                with silent_operation("settings_save_after_autosave_overwrite"):
-                    if hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            self.canvas.parent.autosave_overwrite = bool(chk)
+            # enforce exclusivity: turning on overwrite disables rotate
+            if self.canvas.parent.autosave_overwrite:
+                self.canvas.parent.autosave_rotate = False
+                self.autosave_rotate_chk.blockSignals(True)
+                self.autosave_rotate_chk.setChecked(False)
+                self.autosave_rotate_chk.blockSignals(False)
+            # update rotate count enablement
+            self.autosave_rotate_spin.setEnabled(bool(self.canvas.parent.autosave_rotate))
+            if hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
 
         def _on_autosave_rotate(chk):
-            with silent_operation("settings_autosave_rotate"):
-                self.canvas.parent.autosave_rotate = bool(chk)
-                # enforce exclusivity: turning on rotate disables overwrite
-                if self.canvas.parent.autosave_rotate:
-                    self.canvas.parent.autosave_overwrite = False
-                    self.autosave_overwrite_chk.blockSignals(True)
-                    self.autosave_overwrite_chk.setChecked(False)
-                    with silent_operation("settings_autosave_unblock_overwrite"):
-                        self.autosave_overwrite_chk.blockSignals(False)
-                # update rotate count enablement
-                with silent_operation("settings_autosave_update_rotate_spin2"):
-                    self.autosave_rotate_spin.setEnabled(bool(self.canvas.parent.autosave_rotate))
-                with silent_operation("settings_save_after_autosave_rotate"):
-                    if hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            self.canvas.parent.autosave_rotate = bool(chk)
+            # enforce exclusivity: turning on rotate disables overwrite
+            if self.canvas.parent.autosave_rotate:
+                self.canvas.parent.autosave_overwrite = False
+                self.autosave_overwrite_chk.blockSignals(True)
+                self.autosave_overwrite_chk.setChecked(False)
+                self.autosave_overwrite_chk.blockSignals(False)
+            # update rotate count enablement
+            self.autosave_rotate_spin.setEnabled(bool(self.canvas.parent.autosave_rotate))
+            if hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
 
         def _on_autosave_rotate_count(v):
-            with silent_operation("settings_autosave_rotate_count"):
-                self.canvas.parent.autosave_rotate_count = int(v)
-                with silent_operation("settings_save_after_rotate_count"):
-                    if hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
+            self.canvas.parent.autosave_rotate_count = int(v)
+            if hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
 
         # connect signals
-        with silent_operation("settings_connect_autosave_signals"):
-            self.autosave_chk.toggled.connect(_on_autosave_toggled)
-            self.autosave_interval_spin.valueChanged.connect(_on_autosave_interval)
-            self.autosave_overwrite_chk.toggled.connect(_on_autosave_overwrite)
-            self.autosave_rotate_chk.toggled.connect(_on_autosave_rotate)
-            self.autosave_rotate_spin.valueChanged.connect(_on_autosave_rotate_count)
+        self.autosave_chk.toggled.connect(_on_autosave_toggled)
+        self.autosave_interval_spin.valueChanged.connect(_on_autosave_interval)
+        self.autosave_overwrite_chk.toggled.connect(_on_autosave_overwrite)
+        self.autosave_rotate_chk.toggled.connect(_on_autosave_rotate)
+        self.autosave_rotate_spin.valueChanged.connect(_on_autosave_rotate_count)
 
         gen_l.addRow(autosave_group)
         gen_w.setLayout(gen_l)
@@ -2395,36 +2361,34 @@ class SettingsDialog(EditorDialogBase):
         self.grid_visible_chk = QCheckBox('Show grid background')
         self.grid_visible_chk.setChecked(bool(getattr(self.canvas, '_grid_visible', True)))
         def _on_grid_visible(chk):
-            with silent_operation("settings_grid_visible"):
-                self.canvas.set_grid_visible(bool(chk))
-                _save_if_prefer_app()
+            self.canvas.set_grid_visible(bool(chk))
+            _save_if_prefer_app()
         self.grid_visible_chk.toggled.connect(_on_grid_visible)
         perf_form.addRow(self.grid_visible_chk)
 
         self.frames_enabled_chk = QCheckBox('Show frame outlines (debug)')
         self.frames_enabled_chk.setChecked(bool(getattr(self.canvas, 'frames_enabled', False)))
         def _on_frames_enabled(chk):
-            with silent_operation("settings_frames_enabled"):
-                self.canvas.frames_enabled = bool(chk)
-                if not chk:
-                    # clear frames when disabled
-                    try:
-                        self.canvas.clear_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                # mark frames dirty so they update on next render
+            self.canvas.frames_enabled = bool(chk)
+            if not chk:
+                # clear frames when disabled
                 try:
-                    self.canvas._frames_dirty = True
+                    self.canvas.clear_frames()
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                _save_if_prefer_app()
-                if chk:
-                    # trigger immediate update when enabling
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                _refresh_canvas_items()
+            # mark frames dirty so they update on next render
+            try:
+                self.canvas._frames_dirty = True
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            _save_if_prefer_app()
+            if chk:
+                # trigger immediate update when enabling
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            _refresh_canvas_items()
         self.frames_enabled_chk.toggled.connect(_on_frames_enabled)
         perf_form.addRow(self.frames_enabled_chk)
 
@@ -2435,75 +2399,70 @@ class SettingsDialog(EditorDialogBase):
         self.show_frame_labels_chk = QCheckBox('Show frame labels')
         self.show_frame_labels_chk.setChecked(bool(getattr(self.canvas, 'show_frame_labels', True)))
         def _on_frame_labels(chk):
-            with silent_operation("settings_frame_labels"):
-                self.canvas.show_frame_labels = bool(chk)
-                self.canvas._frames_dirty = True
-                _save_if_prefer_app()
-                if self.canvas.frames_enabled:
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            self.canvas.show_frame_labels = bool(chk)
+            self.canvas._frames_dirty = True
+            _save_if_prefer_app()
+            if self.canvas.frames_enabled:
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         self.show_frame_labels_chk.toggled.connect(_on_frame_labels)
         frame_types_layout.addWidget(self.show_frame_labels_chk)
         
         self.show_network_frames_chk = QCheckBox('Show network frames')
         self.show_network_frames_chk.setChecked(bool(getattr(self.canvas, 'show_network_frames', True)))
         def _on_network_frames(chk):
-            with silent_operation("settings_network_frames"):
-                self.canvas.show_network_frames = bool(chk)
-                self.canvas._frames_dirty = True
-                _save_if_prefer_app()
-                if self.canvas.frames_enabled:
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            self.canvas.show_network_frames = bool(chk)
+            self.canvas._frames_dirty = True
+            _save_if_prefer_app()
+            if self.canvas.frames_enabled:
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         self.show_network_frames_chk.toggled.connect(_on_network_frames)
         frame_types_layout.addWidget(self.show_network_frames_chk)
         
         self.show_layer_frames_chk = QCheckBox('Show layer frames')
         self.show_layer_frames_chk.setChecked(bool(getattr(self.canvas, 'show_layer_frames', True)))
         def _on_layer_frames(chk):
-            with silent_operation("settings_layer_frames"):
-                self.canvas.show_layer_frames = bool(chk)
-                self.canvas._frames_dirty = True
-                _save_if_prefer_app()
-                if self.canvas.frames_enabled:
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            self.canvas.show_layer_frames = bool(chk)
+            self.canvas._frames_dirty = True
+            _save_if_prefer_app()
+            if self.canvas.frames_enabled:
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         self.show_layer_frames_chk.toggled.connect(_on_layer_frames)
         frame_types_layout.addWidget(self.show_layer_frames_chk)
         
         self.show_subtree_frames_chk = QCheckBox('Show subtree frames')
         self.show_subtree_frames_chk.setChecked(bool(getattr(self.canvas, 'show_subtree_frames', True)))
         def _on_subtree_frames(chk):
-            with silent_operation("settings_subtree_frames"):
-                self.canvas.show_subtree_frames = bool(chk)
-                self.canvas._frames_dirty = True
-                _save_if_prefer_app()
-                if self.canvas.frames_enabled:
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            self.canvas.show_subtree_frames = bool(chk)
+            self.canvas._frames_dirty = True
+            _save_if_prefer_app()
+            if self.canvas.frames_enabled:
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         self.show_subtree_frames_chk.toggled.connect(_on_subtree_frames)
         frame_types_layout.addWidget(self.show_subtree_frames_chk)
         
         self.show_lineage_frames_chk = QCheckBox('Show lineage frames')
         self.show_lineage_frames_chk.setChecked(bool(getattr(self.canvas, 'show_lineage_frames', True)))
         def _on_lineage_frames(chk):
-            with silent_operation("settings_lineage_frames"):
-                self.canvas.show_lineage_frames = bool(chk)
-                self.canvas._frames_dirty = True
-                _save_if_prefer_app()
-                if self.canvas.frames_enabled:
-                    try:
-                        self.canvas.update_frames()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            self.canvas.show_lineage_frames = bool(chk)
+            self.canvas._frames_dirty = True
+            _save_if_prefer_app()
+            if self.canvas.frames_enabled:
+                try:
+                    self.canvas.update_frames()
+                except Exception as e:
+                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         self.show_lineage_frames_chk.toggled.connect(_on_lineage_frames)
         frame_types_layout.addWidget(self.show_lineage_frames_chk)
         
@@ -2516,50 +2475,45 @@ class SettingsDialog(EditorDialogBase):
         self.dynamic_scaling_chk = QCheckBox('Enable dynamic title/icon scaling')
         self.dynamic_scaling_chk.setChecked(bool(getattr(self.canvas, 'enable_dynamic_title_icon_scaling', True)))
         def _on_dynamic_scaling(chk):
-            with silent_operation("settings_dynamic_scaling"):
-                self.canvas.enable_dynamic_title_icon_scaling = bool(chk)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.enable_dynamic_title_icon_scaling = bool(chk)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.dynamic_scaling_chk.toggled.connect(_on_dynamic_scaling)
         detail_form.addRow(self.dynamic_scaling_chk)
 
         self.dynamic_zoom_spin = QDoubleSpinBox(); self.dynamic_zoom_spin.setRange(0.0, 2.0); self.dynamic_zoom_spin.setSingleStep(0.05)
         self.dynamic_zoom_spin.setValue(float(getattr(self.canvas, 'title_icon_scale_zoom_threshold', 0.3)))
         def _on_dynamic_zoom(v):
-            with silent_operation("settings_dynamic_zoom_threshold"):
-                self.canvas.title_icon_scale_zoom_threshold = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.title_icon_scale_zoom_threshold = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.dynamic_zoom_spin.valueChanged.connect(_on_dynamic_zoom)
         detail_form.addRow('Scaling zoom threshold:', self.dynamic_zoom_spin)
 
         self.dynamic_max_spin = QDoubleSpinBox(); self.dynamic_max_spin.setRange(1.0, 5.0); self.dynamic_max_spin.setSingleStep(0.1)
         self.dynamic_max_spin.setValue(float(getattr(self.canvas, 'title_icon_scale_max_multiplier', 2.5)))
         def _on_dynamic_max(v):
-            with silent_operation("settings_dynamic_max_multiplier"):
-                self.canvas.title_icon_scale_max_multiplier = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.title_icon_scale_max_multiplier = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.dynamic_max_spin.valueChanged.connect(_on_dynamic_max)
         detail_form.addRow('Max scale multiplier:', self.dynamic_max_spin)
 
         self.simple_render_spin = QDoubleSpinBox(); self.simple_render_spin.setRange(0.0, 2.0); self.simple_render_spin.setSingleStep(0.05)
         self.simple_render_spin.setValue(float(getattr(self.canvas, 'simple_render_zoom_threshold', 0.0)))
         def _on_simple_render(v):
-            with silent_operation("settings_simple_render_threshold"):
-                self.canvas.simple_render_zoom_threshold = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.simple_render_zoom_threshold = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.simple_render_spin.valueChanged.connect(_on_simple_render)
         detail_form.addRow('Simple render zoom threshold:', self.simple_render_spin)
 
         self.connection_lod_spin = QDoubleSpinBox(); self.connection_lod_spin.setRange(0.0, 1.0); self.connection_lod_spin.setSingleStep(0.05)
         self.connection_lod_spin.setValue(float(getattr(self.canvas, 'connection_lod_threshold', 0.0)))
         def _on_connection_lod(v):
-            with silent_operation("settings_connection_lod"):
-                self.canvas.connection_lod_threshold = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.connection_lod_threshold = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.connection_lod_spin.valueChanged.connect(_on_connection_lod)
         detail_form.addRow('Connection LOD threshold:', self.connection_lod_spin)
 
@@ -2572,96 +2526,88 @@ class SettingsDialog(EditorDialogBase):
         self.culling_enabled_chk = QCheckBox('Enable viewport culling')
         self.culling_enabled_chk.setChecked(bool(getattr(self.canvas, 'culling_enabled', True)))
         def _on_culling_enabled(chk):
-            with silent_operation("settings_culling_enabled"):
-                self.canvas.culling_enabled = bool(chk)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas.culling_enabled = bool(chk)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.culling_enabled_chk.toggled.connect(_on_culling_enabled)
         cull_form.addRow(self.culling_enabled_chk)
 
         self.culling_min_nodes_spin = QSpinBox(); self.culling_min_nodes_spin.setRange(0, 20000)
         self.culling_min_nodes_spin.setValue(int(getattr(self.canvas, 'culling_min_nodes', 150)))
         def _on_cull_min_nodes(v):
-            with silent_operation("settings_cull_min_nodes"):
-                self.canvas.culling_min_nodes = int(v)
-                _save_if_prefer_app()
+            self.canvas.culling_min_nodes = int(v)
+            _save_if_prefer_app()
         self.culling_min_nodes_spin.valueChanged.connect(_on_cull_min_nodes)
         cull_form.addRow('Minimum nodes to cull:', self.culling_min_nodes_spin)
 
         self.culling_min_conns_spin = QSpinBox(); self.culling_min_conns_spin.setRange(0, 20000)
         self.culling_min_conns_spin.setValue(int(getattr(self.canvas, 'culling_min_connections', 250)))
         def _on_cull_min_conns(v):
-            with silent_operation("settings_cull_min_connections"):
-                self.canvas.culling_min_connections = int(v)
-                _save_if_prefer_app()
+            self.canvas.culling_min_connections = int(v)
+            _save_if_prefer_app()
         self.culling_min_conns_spin.valueChanged.connect(_on_cull_min_conns)
         cull_form.addRow('Minimum connections to cull:', self.culling_min_conns_spin)
 
         self.cull_margin_spin = QSpinBox(); self.cull_margin_spin.setRange(50, 5000)
         self.cull_margin_spin.setValue(int(getattr(self.canvas, '_cull_margin', 300)))
         def _on_cull_margin(v):
-            with silent_operation("settings_cull_margin"):
-                self.canvas._cull_margin = int(v)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas._cull_margin = int(v)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.cull_margin_spin.valueChanged.connect(_on_cull_margin)
         cull_form.addRow('Viewport cull margin (px):', self.cull_margin_spin)
 
         self.zoom_culling_chk = QCheckBox('Enable zoom-based culling')
         self.zoom_culling_chk.setChecked(bool(getattr(self.canvas, 'zoom_culling_enabled', True)))
         def _on_zoom_culling(chk):
-            with silent_operation("settings_zoom_culling"):
-                self.canvas.zoom_culling_enabled = bool(chk)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas.zoom_culling_enabled = bool(chk)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.zoom_culling_chk.toggled.connect(_on_zoom_culling)
         cull_form.addRow(self.zoom_culling_chk)
 
         self.zoom_cull_threshold_spin = QDoubleSpinBox(); self.zoom_cull_threshold_spin.setRange(0.0, 2.0); self.zoom_cull_threshold_spin.setSingleStep(0.05)
         self.zoom_cull_threshold_spin.setValue(float(getattr(self.canvas, 'zoom_cull_threshold', 0.3)))
         def _on_zoom_threshold(v):
-            with silent_operation("settings_zoom_cull_threshold"):
-                self.canvas.zoom_cull_threshold = float(v)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas.zoom_cull_threshold = float(v)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.zoom_cull_threshold_spin.valueChanged.connect(_on_zoom_threshold)
         cull_form.addRow('Zoom cull threshold:', self.zoom_cull_threshold_spin)
 
         self.zoom_cull_margin_factor_spin = QDoubleSpinBox(); self.zoom_cull_margin_factor_spin.setRange(0.0, 1.0); self.zoom_cull_margin_factor_spin.setSingleStep(0.05)
         self.zoom_cull_margin_factor_spin.setValue(float(getattr(self.canvas, 'zoom_cull_margin_factor', 0.4)))
         def _on_zoom_margin_factor(v):
-            with silent_operation("settings_zoom_cull_margin_factor"):
-                self.canvas.zoom_cull_margin_factor = float(v)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas.zoom_cull_margin_factor = float(v)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.zoom_cull_margin_factor_spin.valueChanged.connect(_on_zoom_margin_factor)
         cull_form.addRow('Zoom cull margin factor:', self.zoom_cull_margin_factor_spin)
 
         self.zoom_cull_min_margin_spin = QSpinBox(); self.zoom_cull_min_margin_spin.setRange(0, 2000)
         self.zoom_cull_min_margin_spin.setValue(int(getattr(self.canvas, 'zoom_cull_min_margin', 100)))
         def _on_zoom_min_margin(v):
-            with silent_operation("settings_zoom_cull_min_margin"):
-                self.canvas.zoom_cull_min_margin = int(v)
-                _save_if_prefer_app()
-                try:
-                    self.canvas._perform_cull()
-                except Exception:
-                    _refresh_canvas_items()
+            self.canvas.zoom_cull_min_margin = int(v)
+            _save_if_prefer_app()
+            try:
+                self.canvas._perform_cull()
+            except Exception:
+                _refresh_canvas_items()
         self.zoom_cull_min_margin_spin.valueChanged.connect(_on_zoom_min_margin)
         cull_form.addRow('Zoom cull min margin (px):', self.zoom_cull_min_margin_spin)
 
@@ -2716,13 +2662,10 @@ class SettingsDialog(EditorDialogBase):
         self.render_node_ids_chk = QCheckBox('Show node IDs')
         self.render_node_ids_chk.setChecked(bool(getattr(self.canvas, 'render_node_ids', True)))
         def _on_render_node_ids(chk):
-            with silent_operation("settings_render_node_ids"):
-                self.canvas.render_node_ids = bool(chk)
-                with silent_operation("settings_save_after_render_node_ids"):
-                    if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
-                with silent_operation("settings_refresh_after_render_node_ids"):
-                    self.canvas.schedule_frame_update()
+            self.canvas.render_node_ids = bool(chk)
+            if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
+            self.canvas.schedule_frame_update()
         self.render_node_ids_chk.toggled.connect(_on_render_node_ids)
         title_group_layout.addRow(self.render_node_ids_chk)
 
@@ -2735,15 +2678,12 @@ class SettingsDialog(EditorDialogBase):
         self.country_event_mode_chk = QCheckBox('Enable country event rendering mode')
         self.country_event_mode_chk.setChecked(bool(getattr(self.canvas, 'country_event_mode', False)))
         def _on_country_event_mode(chk):
-            with silent_operation("settings_country_event_mode"):
-                self.canvas.country_event_mode = bool(chk)
-                # Persist if app-wide preference is enabled
-                with silent_operation("settings_save_after_country_event_mode"):
-                    if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
-                        self.canvas.parent.save_settings()
-                # Refresh canvas
-                with silent_operation("settings_refresh_after_country_event_mode"):
-                    self.canvas.schedule_frame_update()
+            self.canvas.country_event_mode = bool(chk)
+            # Persist if app-wide preference is enabled
+            if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                self.canvas.parent.save_settings()
+            # Refresh canvas
+            self.canvas.schedule_frame_update()
         self.country_event_mode_chk.toggled.connect(_on_country_event_mode)
         country_group_layout.addRow(self.country_event_mode_chk)
 
@@ -3299,83 +3239,76 @@ class SettingsDialog(EditorDialogBase):
         self.lineage_mode_chk = QCheckBox('Visualizer lineage mode')
         self.lineage_mode_chk.setChecked(bool(getattr(self.canvas, 'visualizer_lineage_mode', True)))
         def _on_lineage_mode(chk):
-            with silent_operation("settings_lineage_mode"):
-                self.canvas.visualizer_lineage_mode = bool(chk)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.visualizer_lineage_mode = bool(chk)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.lineage_mode_chk.toggled.connect(_on_lineage_mode)
         adv_form.addRow(self.lineage_mode_chk)
 
         self.lineage_color_chk = QCheckBox('Color lines by lineage')
         self.lineage_color_chk.setChecked(bool(getattr(self.canvas, 'color_lines_by_lineage', True)))
         def _on_lineage_color(chk):
-            with silent_operation("settings_lineage_color" ):
-                self.canvas.color_lines_by_lineage = bool(chk)
-                _save_if_prefer_app()
-                try:
-                    self.canvas.refresh_connection_colors()
-                except Exception as e:
-                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                _refresh_canvas_items()
+            self.canvas.color_lines_by_lineage = bool(chk)
+            _save_if_prefer_app()
+            try:
+                self.canvas.refresh_connection_colors()
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            _refresh_canvas_items()
         self.lineage_color_chk.toggled.connect(_on_lineage_color)
         adv_form.addRow(self.lineage_color_chk)
 
         self.auto_layout_chk = QCheckBox('Enable auto layout (beta)')
         self.auto_layout_chk.setChecked(bool(getattr(self.canvas, 'auto_layout_enabled', False)))
         def _on_auto_layout(chk):
-            with silent_operation("settings_auto_layout"):
-                try:
-                    self.canvas.auto_layout_enabled = bool(chk)
-                except Exception as e:
-                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                _save_if_prefer_app()
+            try:
+                self.canvas.auto_layout_enabled = bool(chk)
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            _save_if_prefer_app()
         self.auto_layout_chk.toggled.connect(_on_auto_layout)
         adv_form.addRow(self.auto_layout_chk)
 
         self.connection_width_spin = QSpinBox(); self.connection_width_spin.setRange(1, 12)
         self.connection_width_spin.setValue(int(getattr(self.canvas, 'connection_line_width', 2)))
         def _on_conn_width(v):
-            with silent_operation("settings_connection_width"):
-                self.canvas.connection_line_width = int(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.connection_line_width = int(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.connection_width_spin.valueChanged.connect(_on_conn_width)
         adv_form.addRow('Connection line width:', self.connection_width_spin)
 
         self.undo_limit_spin = QSpinBox(); self.undo_limit_spin.setRange(10, 10000)
         self.undo_limit_spin.setValue(int(getattr(self.canvas, 'undo_limit', 100)))
         def _on_undo_limit(v):
-            with silent_operation("settings_undo_limit"):
-                self.canvas.undo_limit = int(v)
-                _save_if_prefer_app()
+            self.canvas.undo_limit = int(v)
+            _save_if_prefer_app()
         self.undo_limit_spin.valueChanged.connect(_on_undo_limit)
         adv_form.addRow('Undo history limit:', self.undo_limit_spin)
 
         self.notes_enabled_chk = QCheckBox('Enable note items')
         self.notes_enabled_chk.setChecked(bool(getattr(self.canvas, 'notes_enabled', False)))
         def _on_notes_enabled(chk):
-            with silent_operation("settings_notes_enabled"):
-                self.canvas.notes_enabled = bool(chk)
-                _save_if_prefer_app()
-                try:
-                    for it in list(getattr(self.canvas, '_notes_items', [])):
-                        it.set_visible(self.canvas.notes_enabled)
-                    for nf in list(getattr(self.canvas, '_note_focus_links', [])):
-                        nf.setVisible(self.canvas.notes_enabled)
-                    for ne in list(getattr(self.canvas, '_note_event_links', [])):
-                        ne.setVisible(self.canvas.notes_enabled)
-                except Exception as e:
-                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                _refresh_canvas_items()
+            self.canvas.notes_enabled = bool(chk)
+            _save_if_prefer_app()
+            try:
+                for it in list(getattr(self.canvas, '_notes_items', [])):
+                    it.set_visible(self.canvas.notes_enabled)
+                for nf in list(getattr(self.canvas, '_note_focus_links', [])):
+                    nf.setVisible(self.canvas.notes_enabled)
+                for ne in list(getattr(self.canvas, '_note_event_links', [])):
+                    ne.setVisible(self.canvas.notes_enabled)
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            _refresh_canvas_items()
         self.notes_enabled_chk.toggled.connect(_on_notes_enabled)
         adv_form.addRow(self.notes_enabled_chk)
 
         self.drag_to_link_chk = QCheckBox('Drag to link mode (prereqs)')
         self.drag_to_link_chk.setChecked(bool(getattr(self.canvas, 'drag_to_link_mode', False)))
         def _on_drag_to_link(chk):
-            with silent_operation("settings_drag_to_link"):
-                self.canvas.drag_to_link_mode = bool(chk)
-                _save_if_prefer_app()
+            self.canvas.drag_to_link_mode = bool(chk)
+            _save_if_prefer_app()
         self.drag_to_link_chk.toggled.connect(_on_drag_to_link)
         adv_form.addRow(self.drag_to_link_chk)
 
@@ -3394,11 +3327,10 @@ class SettingsDialog(EditorDialogBase):
                 start_col = QColor('#cccccc')
             col = QColorDialog.getColor(start_col, self, 'Choose default focus color')
             if col.isValid():
-                with silent_operation("settings_default_focus_color"):
-                    self.canvas.default_focus_color = col
-                    self.default_focus_color_edit.setText(col.name(QColor.NameFormat.HexArgb))
-                    _save_if_prefer_app()
-                    _refresh_canvas_items()
+                self.canvas.default_focus_color = col
+                self.default_focus_color_edit.setText(col.name(QColor.NameFormat.HexArgb))
+                _save_if_prefer_app()
+                _refresh_canvas_items()
         color_pick_btn.clicked.connect(_pick_default_color)
         col_h = QHBoxLayout(); col_h.addWidget(self.default_focus_color_edit); col_h.addWidget(color_pick_btn)
         adv_form.addRow('Default focus color:', col_h)
@@ -3409,10 +3341,9 @@ class SettingsDialog(EditorDialogBase):
         except Exception:
             self.note_curve_spin.setValue(1.0)
         def _on_note_curve(v):
-            with silent_operation("settings_note_curve"):
-                self.canvas.note_connection_curve_strength = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.note_connection_curve_strength = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.note_curve_spin.valueChanged.connect(_on_note_curve)
         adv_form.addRow('Note connection curve:', self.note_curve_spin)
 
@@ -3422,10 +3353,9 @@ class SettingsDialog(EditorDialogBase):
         except Exception:
             self.mutex_display_spin.setValue(1.0)
         def _on_mutex_display(v):
-            with silent_operation("settings_mutex_display"):
-                self.canvas.mutex_icon_display_scale = float(v)
-                _save_if_prefer_app()
-                _refresh_canvas_items()
+            self.canvas.mutex_icon_display_scale = float(v)
+            _save_if_prefer_app()
+            _refresh_canvas_items()
         self.mutex_display_spin.valueChanged.connect(_on_mutex_display)
         adv_form.addRow('Mutex icon display scale:', self.mutex_display_spin)
 
@@ -3513,9 +3443,9 @@ class SettingsDialog(EditorDialogBase):
         cancel_btn = QPushButton('Cancel')
         def _on_apply():
             try:
-                # Persist settings if the parent prefers app-wide settings
+                # Persist settings unconditionally when Apply is clicked
                 try:
-                    if bool(getattr(self.canvas.parent, 'prefer_app_settings', False)) and hasattr(self.canvas.parent, 'save_settings'):
+                    if hasattr(self.canvas.parent, 'save_settings'):
                         ok = False
                         try:
                             ok = bool(self.canvas.parent.save_settings())

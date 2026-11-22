@@ -41,6 +41,28 @@ DEFAULT_NOUNS = [
     "Command", "Accord", "Drive", "Corps", "Plan", "Act", "Policy", "Campaign"
 ]
 
+
+_PRECOMPUTED_SIBLING_OFFSETS = {
+    1: [0],
+    2: [-0.5, 0.5],
+    3: [-1, 0, 1],
+    4: [-1.5, -0.5, 0.5, 1.5],
+    5: [-2, -1, 0, 1, 2],
+    6: [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+}
+
+def _sibling_offsets(n: int):
+    cached = _PRECOMPUTED_SIBLING_OFFSETS.get(n)
+    if cached is not None:
+        return cached
+    if n <= 1:
+        return [0]
+    if n % 2 == 1:
+        mid = n // 2
+        return [i - mid for i in range(n)]
+    half = n // 2
+    return [i - half - 0.5 for i in range(half)] + [i + 0.5 for i in range(half)]
+
 # endregion
 
 # region Focus Tree Generator
@@ -70,18 +92,184 @@ class FocusTreeGenerator:
         # Flattened pool for quick sampling
         self._theme_pool: List[str] = []
         for k, v in (self.theme or {}).items():
-            with silent_operation("theme_pool_init"):
-                if isinstance(v, list):
-                    self._theme_pool.extend([str(x) for x in v])
+            if isinstance(v, list):
+                self._theme_pool.extend([str(x) for x in v])
         self._used_theme_names: set = set()
         # layout randomness/current rnd holder for helpers
         self._last_rnd: Optional[random.Random] = None
         self._layout_randomness: float = 0.0
+        self._library_titles: Optional[List[str]] = None
+        self._library_ref: Optional[Dict[str, Dict]] = None
+
+    def _build_random_reward(
+        self,
+        rnd: random.Random,
+        enable_effects: bool,
+        enable_modifiers: bool,
+        effects_range: Tuple[int, int],
+        categories: Optional[List[str]],
+        used_rewards: set,
+        research_slots_given: List[int],
+    ) -> str:
+        """Build a unique, valid base-game HOI4 completion_reward block (no ideas/events/characters/countries)."""
+        if not enable_effects and not enable_modifiers:
+            return ""
+        cats = [c.lower() for c in (categories or ['political', 'economy', 'military', 'research'])]
+        if not cats:
+            cats = ['political', 'economy', 'military', 'research']
+
+        def _pick_effect() -> str:
+            cat = rnd.choice(cats)
+            if cat == 'political':
+                choice = rnd.randint(0, 4)
+                if choice == 0:
+                    return f"add_political_power = {rnd.choice([25, 50, 75, 100, 120, 150])}"
+                if choice == 1:
+                    return f"add_stability = {rnd.choice([0.02, 0.03, 0.05, 0.08, 0.10]):.2f}"
+                if choice == 2:
+                    return f"add_war_support = {rnd.choice([0.02, 0.03, 0.05, 0.08, 0.10]):.2f}"
+                if choice == 3:
+                    return f"add_command_power = {rnd.choice([10, 15, 20, 25, 35])}"
+                ideol = rnd.choice(['democratic', 'communism', 'fascism', 'neutrality'])
+                return (
+                    "add_popularity = {\n"
+                    f"    ideology = {ideol}\n"
+                    f"    popularity = {rnd.choice([0.03, 0.05, 0.08, 0.10]):.2f}\n"
+                    "}"
+                )
+            if cat == 'economy':
+                choice = rnd.randint(0, 4)
+                if choice in (0, 1):
+                    btype = 'industrial_complex' if choice == 0 else 'arms_factory'
+                    lvl = rnd.choice([1, 1, 2])
+                    return (
+                        "random_owned_controlled_state = {\n"
+                        f"    limit = {{ free_building_slots = {{ building = {btype} size > 0 include_locked = yes }} }}\n"
+                        f"    add_extra_state_shared_building_slots = {lvl}\n"
+                        f"    add_building_construction = {{ type = {btype} level = {lvl} instant_build = yes }}\n"
+                        "}"
+                    )
+                if choice == 2:
+                    lvl = rnd.choice([1, 2])
+                    return (
+                        "random_owned_controlled_state = {\n"
+                        "    limit = { free_building_slots = { building = infrastructure size > 0 include_locked = yes } }\n"
+                        f"    add_building_construction = {{ type = infrastructure level = {lvl} instant_build = yes }}\n"
+                        "}"
+                    )
+                if choice == 3:
+                    btype = rnd.choice(['industrial_complex', 'arms_factory'])
+                    return f"add_offsite_building = {{ type = {btype} level = {rnd.choice([1, 2])} }}"
+                res = rnd.choice(['steel', 'oil', 'aluminium', 'tungsten', 'chromium'])
+                amt = rnd.choice([4, 6, 8, 12])
+                return (
+                    "random_owned_controlled_state = {\n"
+                    "    limit = { is_controlled_by = ROOT }\n"
+                    f"    add_resource = {{ type = {res} amount = {amt} }}\n"
+                    "}"
+                )
+            if cat == 'military':
+                choice = rnd.randint(0, 4)
+                if choice == 0:
+                    exp = rnd.choice(['army_experience', 'navy_experience', 'air_experience'])
+                    return f"{exp} = {rnd.choice([10, 15, 25, 35, 50])}"
+                if choice == 1:
+                    return f"add_manpower = {rnd.choice([5000, 10000, 15000, 25000, 50000])}"
+                if choice == 2:
+                    eq = rnd.choice(['infantry_equipment', 'support_equipment', 'artillery_equipment'])
+                    amt = rnd.choice([250, 500, 1000, 1500]) if eq == 'infantry_equipment' else rnd.choice([100, 200, 350])
+                    return f"add_equipment_to_stockpile = {{ type = {eq} amount = {amt} }}"
+                if choice == 3:
+                    doc = rnd.choice(['land_doctrine', 'naval_doctrine', 'air_doctrine'])
+                    return (
+                        "add_doctrine_cost_reduction = {\n"
+                        f"    name = {doc}_bonus\n"
+                        f"    cost_reduction = {rnd.choice([0.25, 0.5, 0.75]):.2f}\n"
+                        f"    uses = {rnd.choice([1, 2])}\n"
+                        f"    category = {doc}\n"
+                        "}"
+                    )
+                return (
+                    "random_owned_controlled_state = {\n"
+                    "    limit = { is_coastal = yes free_building_slots = { building = dockyard size > 0 include_locked = yes } }\n"
+                    "    add_extra_state_shared_building_slots = 1\n"
+                    "    add_building_construction = { type = dockyard level = 1 instant_build = yes }\n"
+                    "}"
+                )
+            # research
+            if research_slots_given[0] < 2 and rnd.random() < 0.08:
+                research_slots_given[0] += 1
+                return "add_research_slot = 1"
+            tcat = rnd.choice(['industry', 'infantry_weapons', 'armor', 'electronics', 'air_equipment', 'naval_equipment', 'artillery'])
+            return (
+                "add_tech_bonus = {\n"
+                f"    name = {tcat}_bonus\n"
+                f"    bonus = {rnd.choice([0.5, 0.75, 1.0]):.2f}\n"
+                f"    uses = {rnd.choice([1, 2])}\n"
+                f"    category = {tcat}\n"
+                "}"
+            )
+
+        def _pick_modifier() -> str:
+            mod_pool = [
+                ("local_resources_factor", rnd.choice([0.10, 0.15, 0.20])),
+                ("state_production_speed_buildings_factor", rnd.choice([0.05, 0.10, 0.15])),
+                ("local_building_slots_factor", rnd.choice([0.10, 0.15, 0.20])),
+                ("local_manpower", rnd.choice([0.10, 0.15, 0.25])),
+                ("local_supplies", rnd.choice([0.10, 0.15, 0.20])),
+                ("mobilization_speed", rnd.choice([0.10, 0.15, 0.20])),
+            ]
+            chosen = rnd.sample(mod_pool, k=rnd.randint(1, 2))
+            lines = "\n".join(f"        {k} = {v:.2f}" for k, v in chosen)
+            return (
+                "random_owned_controlled_state = {\n"
+                "    limit = { is_controlled_by = ROOT }\n"
+                "    add_state_modifier = {\n"
+                "        modifier = {\n"
+                f"{lines}\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            )
+
+        lo = max(1, int(effects_range[0]))
+        hi = max(lo, int(effects_range[1]))
+        for _ in range(12):
+            parts: List[str] = []
+            n_items = rnd.randint(lo, hi)
+            for _ in range(n_items):
+                if enable_effects and enable_modifiers:
+                    parts.append(_pick_modifier() if rnd.random() < 0.35 else _pick_effect())
+                elif enable_modifiers:
+                    parts.append(_pick_modifier())
+                else:
+                    parts.append(_pick_effect())
+            block = "\n".join(parts)
+            if block not in used_rewards:
+                used_rewards.add(block)
+                return block
+        # Ensure uniqueness even on large trees
+        block = "\n".join(parts) + f"\nadd_political_power = {rnd.randint(15, 95)}"
+        used_rewards.add(block)
+        return block
+
+    def _build_random_available(self, rnd: random.Random, enable_available: bool) -> str:
+        if not enable_available or rnd.random() > 0.35:
+            return ""
+        return rnd.choice([
+            "has_war = no",
+            "has_war = yes",
+            "is_subject = no",
+            "has_political_power > 50",
+            "threat > 0.10",
+        ])
 
     def _next_id(self, counter: int) -> str:
-        """Create a compact unique id using prefix and a short uuid fragment."""
-        short = uuid.uuid4().hex[:6]
-        return f"{self.id_prefix}_{counter}_{short}"
+        """Create a compact unique id using prefix and a short hex fragment."""
+        rnd = self._last_rnd
+        if rnd is not None:
+            return f"{self.id_prefix}_{counter}_{rnd.getrandbits(24):06x}"
+        return f"{self.id_prefix}_{counter}_{uuid.uuid4().hex[:6]}"
 
     def _generate_name(self, use_library: bool, use_theme: bool, rnd: random.Random) -> str:
         """Generate a readable focus name.
@@ -102,13 +290,16 @@ class FocusTreeGenerator:
             # fallback to any theme name
             return rnd.choice(self._theme_pool)
 
-        # Library names next
+        # Library names next (cached list of titles avoids rebuilding list(keys) per focus)
         if use_library and self.library:
-            keys = list(self.library.keys())
-            # select random library entry and use its name (if present) or its id
-            entry_key = rnd.choice(keys)
-            entry = self.library.get(entry_key, {})
-            return entry.get("name") or entry.get("id") or entry_key
+            if self._library_titles is None or self._library_ref is not self.library:
+                self._library_ref = self.library
+                self._library_titles = [
+                    (entry.get("name") or entry.get("id") or k) if isinstance(entry, dict) else k
+                    for k, entry in self.library.items()
+                ]
+            if self._library_titles:
+                return rnd.choice(self._library_titles)
         # fallback adjective + noun
         adj = rnd.choice(DEFAULT_ADJECTIVES)
         noun = rnd.choice(DEFAULT_NOUNS)
@@ -149,7 +340,13 @@ class FocusTreeGenerator:
     # Optional weighted mix: list of (style, weight); picked per-root deterministically via seed
     layout_mix: Optional[List[Tuple[str, float]]] = None,
         # Optional theme override for this call
-        theme: Optional[Dict[str, List[str]]] = None
+        theme: Optional[Dict[str, List[str]]] = None,
+        # Optional randomized base-game effects & modifiers (only active when enabled)
+        enable_effects: bool = False,
+        enable_modifiers: bool = False,
+        enable_available: bool = False,
+        effects_per_focus: Tuple[int, int] = (1, 3),
+        effect_categories: Optional[List[str]] = None,
     ) -> List[Focus]:
         """
         Produce a list of Focus objects representing a complete tree.
@@ -186,13 +383,12 @@ class FocusTreeGenerator:
         self._layout_randomness = max(0.0, min(1.0, layout_randomness))
         # optionally override theme for this run
         if theme is not None:
-            with silent_operation("theme_override"):
-                self.theme = theme or {}
-                self._theme_pool = []
-                for k, v in (self.theme or {}).items():
-                    if isinstance(v, list):
-                        self._theme_pool.extend([str(x) for x in v])
-                self._used_theme_names.clear()
+            self.theme = theme or {}
+            self._theme_pool = []
+            for k, v in (self.theme or {}).items():
+                if isinstance(v, list):
+                    self._theme_pool.extend([str(x) for x in v])
+            self._used_theme_names.clear()
         focuses: List[Focus] = []
         id_counter = 0
         # track roots for mutex policy regardless of generation mode
@@ -226,24 +422,33 @@ class FocusTreeGenerator:
                 # fallback to global layout_style
                 return layout_style
 
+            # Pre-build shuffled unique title pool once (O(1) pop instead of O(N) rejection sampling)
+            _title_pool: List[str] = []
+            if use_library_names and self.library:
+                if self._library_titles is None or self._library_ref is not self.library:
+                    self._library_ref = self.library
+                    self._library_titles = [
+                        (entry.get('name') or entry.get('id') or k) if isinstance(entry, dict) else k
+                        for k, entry in self.library.items()
+                    ]
+                _title_pool = list(dict.fromkeys(self._library_titles))
+            else:
+                _title_pool = [f"{a} {n}" for a in DEFAULT_ADJECTIVES for n in DEFAULT_NOUNS]
+            rnd.shuffle(_title_pool)
+            _title_cursor = 0
+            _title_pool_len = len(_title_pool)
+            _fallback_title_idx = 0
+
             def get_unique_title(ancestry_categories):
-                # prefer library names when requested
-                attempts = 0
-                while attempts < 200:
-                    attempts += 1
-                    if use_library_names and self.library:
-                        key = rnd.choice(list(self.library.keys()))
-                        entry = self.library.get(key, {})
-                        title = entry.get('name') or entry.get('id') or key
-                    else:
-                        adj = rnd.choice(DEFAULT_ADJECTIVES)
-                        noun = rnd.choice(DEFAULT_NOUNS)
-                        title = f"{adj} {noun}"
+                nonlocal _title_cursor, _fallback_title_idx
+                while _title_cursor < _title_pool_len:
+                    title = _title_pool[_title_cursor]
+                    _title_cursor += 1
                     if title not in used_titles:
                         used_titles.add(title)
                         return title
-                # fallback
-                title = f"Focus {uuid.uuid4().hex[:6]}"
+                _fallback_title_idx += 1
+                title = f"Focus {_fallback_title_idx}"
                 used_titles.add(title)
                 return title
 
@@ -265,30 +470,30 @@ class FocusTreeGenerator:
                 node_categories[fid] = None
                 node_ancestry[fid] = []
                 node_tags[fid] = forced_root_tags.get(s) if isinstance(forced_root_tags, dict) else None
-                active_nodes.append({'id': fid, 'depth': 0, 'branch': s})
+                active_nodes.append({'id': fid, 'depth': 0, 'branch': s, 'x': fx.x})
                 # choose and record style for this root branch
                 st = pick_style_for_branch(s)
                 branch_style[s] = st
-                with silent_operation("set_branch_style"):
-                    setattr(fx, 'branch_style', st)
+                setattr(fx, 'branch_style', st)
                 nodes_created += 1
 
+            # Precompute loop invariants
+            _lam = max(0.5, max(1.0, branch_density / 5.0))
+            _poisson_L = math.exp(-_lam)
+            _id_to_focus: Dict[str, Focus] = {f.id: f for f in focuses}
             # Growth loop (similar to JS generateTree) with more varied layout
             while nodes_created < node_count and active_nodes:
                 parent_idx = rnd.randrange(len(active_nodes))
                 parent = active_nodes[parent_idx]
                 # If parent already at or beyond max_depth and enforcing cap, stop expanding it
-                if enforce_depth_cap and parent.get('depth', 0) >= max_depth:
-                    active_nodes.pop(parent_idx)
+                if enforce_depth_cap and parent['depth'] >= max_depth:
+                    active_nodes[parent_idx] = active_nodes[-1]
+                    active_nodes.pop()
                     continue
-                # Determine number of children using a biased distribution: mostly 1, sometimes 2-4
-                mean_children = max(1.0, branch_density / 5.0)
-                # sample from Poisson-like (clip at 6)
-                lam = max(0.5, mean_children)
-                # approx Poisson via Knuth
+                # sample from Poisson-like (clip at 6) via Knuth
                 k = 0
                 p = 1.0
-                L = pow(2.718281828, -lam)
+                L = _poisson_L
                 while True:
                     k += 1
                     p *= rnd.random()
@@ -301,36 +506,19 @@ class FocusTreeGenerator:
                 if num_children <= 0:
                     # no children to add; possibly retire this parent
                     if rnd.random() < 0.8:
-                        active_nodes.pop(parent_idx)
+                        active_nodes[parent_idx] = active_nodes[-1]
+                        active_nodes.pop()
                     continue
 
                 # Depth-dependent spacing: deeper nodes compress horizontally a bit
                 depth = parent['depth'] + 1
                 depth_spacing = max(1, int(spacing[0] * (1.0 - min(0.6, depth * 0.05))))
 
-                # Compute sibling offsets to center children under parent with better distribution
-                def sibling_offsets(n):
-                    if n <= 1:
-                        return [0]
-                    # produce offsets like -2,-1,0,1,2 for n=5 or -1.5,-0.5,0.5,1.5 for even counts
-                    offsets = []
-                    if n % 2 == 1:
-                        mid = n // 2
-                        for i in range(n):
-                            offsets.append(i - mid)
-                    else:
-                        half = n // 2
-                        for i in range(half):
-                            offsets.append(i - half - 0.5)
-                        for i in range(half):
-                            offsets.append(i + 0.5)
-                    return offsets
-
-                offsets = sibling_offsets(num_children)
-
-                # Find parent's x (fallback to 0)
-                p_focus = next((f for f in focuses if f.id == parent['id']), None)
-                parent_x = p_focus.x if p_focus is not None else 0
+                offsets = _sibling_offsets(num_children)
+                parent_x = parent.get('x')
+                if parent_x is None:
+                    p_focus = _id_to_focus.get(parent['id'])
+                    parent_x = p_focus.x if p_focus is not None else 0
 
                 # cluster center bias for 'clustered' style
                 cluster_center = 0
@@ -418,17 +606,14 @@ class FocusTreeGenerator:
 
                     # assign subtree_layer as parent's branch index so UI can render distinct frames
                     focus = Focus(id=fid, name=title, x=child_x, y=child_y, cost=max(5, rnd.randint(6, 30)), prerequisites=[parent['id']])
-                    with silent_operation("set_subtree_layer_branch_style"):
-                        setattr(focus, 'subtree_layer', parent.get('branch', 0))
-                        setattr(focus, 'branch_style', effective_style)
+                    setattr(focus, 'subtree_layer', parent.get('branch', 0))
+                    setattr(focus, 'branch_style', effective_style)
                     focuses.append(focus)
+                    _id_to_focus[fid] = focus
                     created_children.append(focus)
-                    node_categories[fid] = None
-                    node_ancestry[fid] = node_ancestry.get(parent['id'], []) + [node_tags.get(parent['id'])]
-                    node_tags[fid] = node_tags.get(parent['id'])
                     # Only expand this child further if depth cap not reached
                     if (not enforce_depth_cap) or (depth < max_depth):
-                        active_nodes.append({'id': fid, 'depth': depth, 'branch': parent['branch']})
+                        active_nodes.append({'id': fid, 'depth': depth, 'branch': parent['branch'], 'x': child_x})
                     nodes_created += 1
 
                 # Apply sibling-level mutually exclusive constraints if requested
@@ -464,13 +649,13 @@ class FocusTreeGenerator:
                             pass
                         else:
                             if target.id not in node_ancestry.get(parent['id'], []):
-                                with silent_operation("append_prerequisite"):
-                                    focuses[-1].prerequisites.append(target.id)
+                                focuses[-1].prerequisites.append(target.id)
 
                 # Remove parent from active_nodes with higher probability as depth increases
                 branch_prob = pow(0.75, parent['depth'])
                 if rnd.random() > branch_prob:
-                    active_nodes.pop(parent_idx)
+                    active_nodes[parent_idx] = active_nodes[-1]
+                    active_nodes.pop()
 
         else:
             # Keep track of nodes by depth and by branch to help position children beneath parents.
@@ -506,8 +691,7 @@ class FocusTreeGenerator:
                 # assign and record style for this root branch
                 st = pick_style_for_branch(r)
                 branch_style[r] = st
-                with silent_operation("set_root_branch_style"):
-                    setattr(fx, 'branch_style', st)
+                setattr(fx, 'branch_style', st)
                 layers.setdefault(0, []).append(fx)
                 node_branch_index[fx.id] = r
 
@@ -585,10 +769,9 @@ class FocusTreeGenerator:
                             cost=max(5, rnd.randint(6, 30)),
                             prerequisites=[parent.id]
                         )
-                        with silent_operation("set_child_subtree_layer"):
-                            # Layer children by parent index to allow distinct frames per subtree
-                            setattr(focus, 'subtree_layer', p_index)
-                            setattr(focus, 'branch_style', effective_style)
+                        # Layer children by parent index to allow distinct frames per subtree
+                        setattr(focus, 'subtree_layer', p_index)
+                        setattr(focus, 'branch_style', effective_style)
                         layer_nodes.append(focus)
                         focuses.append(focus)
                         # propagate branch index for descendants
@@ -621,12 +804,23 @@ class FocusTreeGenerator:
                 r.mutually_exclusive = [x for x in root_ids if x != r.id]
 
         # Final pass: compute subtree layout so parents are centered above grouped children
-        with silent_operation("layout_subtrees"):
-            self._layout_subtrees(focuses, spacing[0])
+        self._layout_subtrees(focuses, spacing[0])
 
         # Then compact X positions to avoid collisions on the same grid positions
         self._resolve_collisions(focuses)
 
+        if enable_effects or enable_modifiers or enable_available:
+            used_rewards: set = set()
+            research_slots_given = [0]
+            for fx in focuses:
+                if enable_effects or enable_modifiers:
+                    fx.completion_reward = self._build_random_reward(
+                        rnd, enable_effects, enable_modifiers,
+                        effects_per_focus, effect_categories,
+                        used_rewards, research_slots_given,
+                    )
+                if enable_available:
+                    fx.available = self._build_random_available(rnd, enable_available)
         return focuses
 
     def _resolve_collisions(self, focuses: List[Focus]) -> None:
@@ -634,45 +828,46 @@ class FocusTreeGenerator:
         Simple collision resolution: if two focuses have same x,y -> shift later ones right.
         Works in grid units; keeps layout deterministic for given order.
         """
-        # Group by row (y) and spread nodes to avoid long rightward chains
         by_row: Dict[int, List[Focus]] = {}
         for f in focuses:
             by_row.setdefault(f.y, []).append(f)
 
+        rnd = self._last_rnd or random.Random()
+        rand_fn = rnd.random
         for y, row in by_row.items():
-            # sort by x to determine collisions
+            if len(row) <= 1:
+                continue
             row.sort(key=lambda f: f.x)
-            occupied = set()
+            occupied_x = set()
             for f in row:
-                if (f.x, f.y) not in occupied:
-                    occupied.add((f.x, f.y))
+                fx = f.x
+                if fx not in occupied_x:
+                    occupied_x.add(fx)
                     continue
-                # Collision: try to place symmetrically around the intended x
-                base_x = f.x
+                base_x = fx
                 offset = 1
                 placed = False
-                while not placed:
-                    # decide exploration order based on randomness to avoid uniform rightward bias
-                    rnd = self._last_rnd or random.Random()
-                    if rnd.random() < 0.5:
-                        candidates = (base_x - offset, base_x + offset)
+                while offset <= 100:
+                    if rand_fn() < 0.5:
+                        c1, c2 = base_x - offset, base_x + offset
                     else:
-                        candidates = (base_x + offset, base_x - offset)
-                    for candidate in candidates:
-                        pos = (candidate, y)
-                        if pos not in occupied:
-                            f.x = candidate
-                            occupied.add(pos)
-                            placed = True
-                            break
-                    offset += 1
-                    # safety clamp (shouldn't happen normally)
-                    if offset > 100:
-                        # fall back to pushing right
-                        while (f.x, y) in occupied:
-                            f.x += 1
-                        occupied.add((f.x, y))
+                        c1, c2 = base_x + offset, base_x - offset
+                    if c1 not in occupied_x:
+                        f.x = c1
+                        occupied_x.add(c1)
                         placed = True
+                        break
+                    if c2 not in occupied_x:
+                        f.x = c2
+                        occupied_x.add(c2)
+                        placed = True
+                        break
+                    offset += 1
+                if not placed:
+                    while fx in occupied_x:
+                        fx += 1
+                    f.x = fx
+                    occupied_x.add(fx)
 
     def _layout_subtrees(self, focuses: List[Focus], spacing_x: int = 2) -> None:
         """
@@ -733,16 +928,14 @@ class FocusTreeGenerator:
             root_node = id_map.get(r)
             if root_node is not None:
                 if not hasattr(root_node, 'subtree_layer'):
-                    with silent_operation("set_root_subtree_layer"):
-                        setattr(root_node, 'subtree_layer', 0)
+                    setattr(root_node, 'subtree_layer', 0)
 
         # propagate subtree_layer down primary parent chains
         for nid, parent in primary_parent.items():
             if parent and nid in id_map and parent in id_map:
                 p_layer = getattr(id_map[parent], 'subtree_layer', None)
                 if p_layer is not None and not hasattr(id_map[nid], 'subtree_layer'):
-                    with silent_operation("propagate_subtree_layer"):
-                        setattr(id_map[nid], 'subtree_layer', p_layer)
+                    setattr(id_map[nid], 'subtree_layer', p_layer)
 
         # Compute leaf counts for ordering/stability
         leaf_count: Dict[str, int] = {}
@@ -774,29 +967,7 @@ class FocusTreeGenerator:
                 rnd.shuffle(children[k])
             children[k].sort(key=lambda cid: (-leaf_count.get(cid, 0), _rand_key(), cid))
 
-        # First pass: simple left-to-right leaf assignment to compute widths
-        next_leaf_x = 0
 
-        def simple_layout(fid: str) -> Tuple[int, int]:
-            nonlocal next_leaf_x
-            ch = children.get(fid, [])
-            if not ch:
-                x = next_leaf_x
-                id_map[fid].x = x
-                next_leaf_x += 1
-                return x, x
-            ranges = [simple_layout(c) for c in ch]
-            left = min(r[0] for r in ranges)
-            right = max(r[1] for r in ranges)
-            center = int(round((left + right) / 2.0))
-            id_map[fid].x = center
-            return left, right
-
-        root_gap = 2
-        for i, r in enumerate(sorted(roots)):
-            if i > 0:
-                next_leaf_x += root_gap
-            simple_layout(r)
 
         # Compute subtree widths (leaf units) to reserve horizontal space per subtree
         widths: Dict[str, int] = {}
@@ -872,8 +1043,7 @@ class FocusTreeGenerator:
 
         # Apply computed x positions scaled by spacing_x, then optional jitter for variation
         for f in focuses:
-            with silent_operation("apply_x_position"):
-                f.x = int(round(id_map[f.id].x * spacing_x))
+            f.x = int(round(id_map[f.id].x * spacing_x))
 
         # inject post-layout jitter controlled by layout_randomness
         if lr > 0:
@@ -882,53 +1052,50 @@ class FocusTreeGenerator:
             if jitter_units > 0 or vertical_jitter > 0:
                 for f in focuses:
                     if (self._last_rnd or random).random() < (0.15 + 0.35 * lr):
-                        with silent_operation("apply_jitter"):
-                            # horizontal jitter
-                            if jitter_units > 0:
-                                j = (self._last_rnd or random).randint(-jitter_units, jitter_units)
-                                f.x += j
-                            # vertical jitter for more organic shapes
-                            if vertical_jitter > 0 and (self._last_rnd or random).random() < 0.3:
-                                v = (self._last_rnd or random).randint(0, vertical_jitter)
-                                f.y += v
+                        # horizontal jitter
+                        if jitter_units > 0:
+                            j = (self._last_rnd or random).randint(-jitter_units, jitter_units)
+                            f.x += j
+                        # vertical jitter for more organic shapes
+                        if vertical_jitter > 0 and (self._last_rnd or random).random() < 0.3:
+                            v = (self._last_rnd or random).randint(0, vertical_jitter)
+                            f.y += v
 
         # Post-layout smoothing: nudge children groups a bit toward their parent center
-        with silent_operation("post_layout_smoothing"):
-            # recompute children map according to primary parent policy used earlier
-            children_map: Dict[str, List[Focus]] = {}
-            for f in focuses:
-                for p in f.prerequisites:
-                    if p in id_map and id_map[p].y == f.y - 1:
-                        children_map.setdefault(p, []).append(f)
+        # recompute children map according to primary parent policy used earlier
+        children_map: Dict[str, List[Focus]] = {}
+        for f in focuses:
+            for p in f.prerequisites:
+                if p in id_map and id_map[p].y == f.y - 1:
+                    children_map.setdefault(p, []).append(f)
 
-            for parent_id, ch_list in children_map.items():
-                if not ch_list:
-                    continue
-                parent = id_map.get(parent_id)
-                if not parent:
-                    continue
-                avg_x = sum(c.x for c in ch_list) / len(ch_list)
-                # compute delta to nudge children toward parent's x (small fraction)
-                # stronger nudge for closer grouping while preserving some spread
-                delta = int(round((parent.x - avg_x) * 0.45))
-                if delta != 0:
-                    for c in ch_list:
-                        c.x += delta
+        for parent_id, ch_list in children_map.items():
+            if not ch_list:
+                continue
+            parent = id_map.get(parent_id)
+            if not parent:
+                continue
+            avg_x = sum(c.x for c in ch_list) / len(ch_list)
+            # compute delta to nudge children toward parent's x (small fraction)
+            # stronger nudge for closer grouping while preserving some spread
+            delta = int(round((parent.x - avg_x) * 0.45))
+            if delta != 0:
+                for c in ch_list:
+                    c.x += delta
 
         # Additional proximity smoothing pass: ensure children remain within a window around parent
-        with silent_operation("proximity_smoothing"):
-            for parent_id, ch_list in children_map.items():
-                parent = id_map.get(parent_id)
-                if not parent:
-                    continue
-                # Allowed horizontal window (in grid units)
-                window = max(2, int(round(2 + (1.5 * (self._layout_randomness)))))
-                for c in ch_list:
-                    # clamp child x within parent's x +/- window
-                    if c.x < parent.x - window:
-                        c.x = parent.x - window
-                    elif c.x > parent.x + window:
-                        c.x = parent.x + window
+        for parent_id, ch_list in children_map.items():
+            parent = id_map.get(parent_id)
+            if not parent:
+                continue
+            # Allowed horizontal window (in grid units)
+            window = max(2, int(round(2 + (1.5 * (self._layout_randomness)))))
+            for c in ch_list:
+                # clamp child x within parent's x +/- window
+                if c.x < parent.x - window:
+                    c.x = parent.x - window
+                elif c.x > parent.x + window:
+                    c.x = parent.x + window
 
     # Integration helper -------------------------------------------------
     def apply_to_editor(self, editor, focuses: List[Focus], shift_if_conflict: bool = True) -> List[Focus]:
@@ -952,18 +1119,17 @@ class FocusTreeGenerator:
         # minimum x/y start at 0,0 in editor-grid coordinates. This ensures
         # newly-created projects launch with content anchored at the grid origin
         # both in the editor and when exported to HOI4.
-        with silent_operation("shift_focuses_to_origin"):
-            if len(getattr(editor, 'focuses', [])) == 0 and focuses:
-                xs = [getattr(f, 'x', 0) for f in focuses]
-                ys = [getattr(f, 'y', 0) for f in focuses]
-                min_x = min(xs)
-                min_y = min(ys)
-                if min_x != 0 or min_y != 0:
-                    for f in focuses:
-                        with silent_operation("adjust_focus_x"):
-                            f.x = int(round(f.x - min_x))
-                        with silent_operation("adjust_focus_y"):
-                            f.y = int(round(f.y - min_y))
+        if len(getattr(editor, 'focuses', [])) == 0 and focuses:
+            xs = [getattr(f, 'x', 0) for f in focuses]
+            ys = [getattr(f, 'y', 0) for f in focuses]
+            min_x = min(xs)
+            min_y = min(ys)
+            if min_x != 0 or min_y != 0:
+                for f in focuses:
+                    with silent_operation("adjust_focus_x"):
+                        f.x = int(round(f.x - min_x))
+                    with silent_operation("adjust_focus_y"):
+                        f.y = int(round(f.y - min_y))
 
         for f in focuses:
             original_id = f.id
@@ -987,32 +1153,29 @@ class FocusTreeGenerator:
                 # if prereq was renamed in the previous step, map it
                 # simple policy: assume prereq exists in editor (it will for internal generation)
                 # otherwise skip silently
-                with silent_operation("create_prereq_connection"):
-                    if prereq in existing_ids:
-                        editor.canvas.create_connection(prereq, f.id)
-                    else:
-                        # attempt to find by prefix match
-                        candidates = [e.id for e in editor.focuses if e.id.startswith(prereq)]
-                        if candidates:
-                            editor.canvas.create_connection(candidates[0], f.id)
+                if prereq in existing_ids:
+                    editor.canvas.create_connection(prereq, f.id)
+                else:
+                    # attempt to find by prefix match
+                    cand = next((e.id for e in editor.focuses if e.id.startswith(prereq)), None)
+                    if cand is not None:
+                        editor.canvas.create_connection(cand, f.id)
                 # If this focus has exactly one mutually exclusive partner, also
                 # create a visual connection from the prereq to that partner (if present)
-                with silent_operation("create_mutex_connection"):
-                    mex = getattr(f, 'mutually_exclusive', None)
-                    if isinstance(mex, (list, tuple)) and len(mex) == 1:
-                        mex_id = str(mex[0])
-                        if mex_id in existing_ids:
-                            with silent_operation("create_mutex_direct"):
-                                editor.canvas.create_connection(prereq, mex_id)
-                        else:
-                            candidates = [e.id for e in editor.focuses if e.id.startswith(mex_id)]
-                            if candidates:
-                                with silent_operation("create_mutex_candidate"):
-                                    editor.canvas.create_connection(prereq, candidates[0])
+                mex = getattr(f, 'mutually_exclusive', None)
+                if isinstance(mex, (list, tuple)) and len(mex) == 1:
+                    mex_id = str(mex[0])
+                    if mex_id in existing_ids:
+                        with silent_operation("create_mutex_direct"):
+                            editor.canvas.create_connection(prereq, mex_id)
+                    else:
+                        cand = next((e.id for e in editor.focuses if e.id.startswith(mex_id)), None)
+                        if cand is not None:
+                            with silent_operation("create_mutex_candidate"):
+                                editor.canvas.create_connection(prereq, cand)
 
         editor.update_status()
-        with silent_operation("show_status_message"):
-            editor.statusBar().showMessage(f"Applied generated tree ({len(added)} focuses)")
+        editor.statusBar().showMessage(f"Applied generated tree ({len(added)} focuses)")
 
         return added
 

@@ -1,0 +1,15 @@
+focus_tree={id=spacing_tree
+focus={id=spacing_tight x=0 y=0 cost=10 prerequisite={} }
+	focus
+	=
+	{
+		id
+		=
+		spacing_loose
+
+		x    =    3
+		y	=	4
+
+		cost=1.5
+		prerequisite  =  {  focus  =  spacing_tight  }
+	}focus={id=spacing_jammed x=1 y=1 cost=2 prerequisite={focus=spacing_tight}}}

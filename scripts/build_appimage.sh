@@ -26,18 +26,22 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
 
 echo "[2/6] Building PyInstaller one-folder app"
+mkdir -p "$BUILD_DIR/linux-work" "$DIST_DIR/linux"
 pyinstaller --noconfirm --clean --windowed \
   --name "$APP_NAME" \
-  --add-data "source/_assets:_assets" \
-  --add-data "source/fonts:fonts" \
-  --add-data "source/version.txt:." \
-  source/_focusGUI.py
+  --workpath "$BUILD_DIR/linux-work" \
+  --distpath "$DIST_DIR/linux" \
+  --specpath "$BUILD_DIR/linux-work" \
+  --add-data "$ROOT_DIR/source/_assets:_assets" \
+  --add-data "$ROOT_DIR/source/fonts:fonts" \
+  --add-data "$ROOT_DIR/source/version.txt:." \
+  "$ROOT_DIR/source/_focusGUI.py"
 
 echo "[3/6] Preparing AppDir layout"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/$APP_NAME"
 
-cp -a "$DIST_DIR/$APP_NAME/." "$APPDIR/usr/lib/$APP_NAME/"
+cp -a "$DIST_DIR/linux/$APP_NAME/." "$APPDIR/usr/lib/$APP_NAME/"
 
 # AppRun is the AppImage entry point. It only needs to forward execution
 # to the bundled PyInstaller binary.

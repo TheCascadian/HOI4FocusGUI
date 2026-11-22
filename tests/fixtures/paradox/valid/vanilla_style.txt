@@ -1,0 +1,91 @@
+focus_tree = {
+	id = vanilla_style_tree
+
+	country = {
+		factor = 0
+
+		modifier = {
+			add = 10
+			tag = ENG
+		}
+	}
+
+	default = no
+	reset_on_civil_war = no
+	continuous_focus_position = { x = 50 y = 1200 }
+	initial_show_position = { focus = vanilla_root }
+
+	focus = {
+		id = vanilla_root
+		icon = GFX_goal_generic_political_pressure
+		cost = 10
+		x = 4
+		y = 0
+
+		available = {
+			has_stability > 0.5
+		}
+
+		completion_reward = {
+			add_political_power = 120
+			country_event = { id = vanilla.1 days = 3 }
+		}
+
+		ai_will_do = {
+			factor = 5
+		}
+	}
+
+	focus = {
+		id = vanilla_army
+		icon = GFX_goal_generic_army_doctrines
+		cost = 7.5
+		relative_position_id = vanilla_root
+		x = -2
+		y = 1
+		prerequisite = { focus = vanilla_root }
+		mutually_exclusive = { focus = vanilla_navy }
+		search_filters = { FOCUS_FILTER_MILITARY FOCUS_FILTER_RESEARCH }
+
+		completion_reward = {
+			army_experience = 25
+		}
+	}
+
+	focus = {
+		id = vanilla_navy
+		icon = GFX_goal_generic_navy_doctrines_tactics
+		cost = 7
+		relative_position_id = vanilla_root
+		x = 2
+		y = 1
+		prerequisite = { focus = vanilla_root }
+		mutually_exclusive = { focus = vanilla_army }
+
+		completion_reward = {
+			navy_experience = 25
+		}
+	}
+
+	focus = {
+		id = vanilla_join_war
+		icon = GFX_goal_generic_major_war
+		cost = 5
+		relative_position_id = vanilla_army
+		x = 2
+		y = 1
+		prerequisite = { focus = vanilla_army focus = vanilla_navy }
+		will_lead_to_war_with = { GER ITA }
+		available_if_capitulated = no
+		cancel_if_invalid = yes
+		continue_if_invalid = no
+
+		visible = {
+			has_government = democratic
+		}
+
+		completion_reward = {
+			add_war_support = 0.05
+		}
+	}
+}

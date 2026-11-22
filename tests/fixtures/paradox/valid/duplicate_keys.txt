@@ -1,0 +1,43 @@
+focus_tree = {
+	id = duplicate_keys_tree
+
+	country = {
+		factor = 0
+		modifier = { add = 10 tag = SOV }
+		modifier = { add = 10 tag = RAJ }
+	}
+
+	focus = {
+		id = duplicate_root
+		x = 0
+		y = 0
+		cost = 10
+
+		# Three separate prerequisite blocks: each is its own AND-ed requirement.
+		prerequisite = { focus = dup_a }
+		prerequisite = { focus = dup_b focus = dup_c }
+		prerequisite = { focus = dup_d }
+
+		search_filters = { FOCUS_FILTER_POLITICAL }
+		search_filters = { FOCUS_FILTER_INDUSTRY }
+
+		# Conditional icons: repeated key, order matters.
+		icon = {
+			trigger = { has_government = fascism }
+			value = GFX_goal_generic_fascism
+		}
+		icon = {
+			trigger = { has_government = communism }
+			value = GFX_goal_generic_communism
+		}
+		icon = GFX_goal_generic_fallback
+
+		completion_reward = { add_political_power = 10 }
+		completion_reward = { add_stability = 0.05 }
+	}
+
+	focus = { id = dup_a x = -3 y = 0 cost = 1 }
+	focus = { id = dup_b x = -1 y = 0 cost = 1 }
+	focus = { id = dup_c x = 1 y = 0 cost = 1 }
+	focus = { id = dup_d x = 3 y = 0 cost = 1 }
+}

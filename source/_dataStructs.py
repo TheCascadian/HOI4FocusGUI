@@ -28,8 +28,7 @@ def _normalize_string_list(values: Optional[Union[str, Iterable[Any]]]) -> List[
         return []
     if isinstance(values, str):
         return [values]
-    with silent_operation("Normalize string list iteration"):
-        return [str(item) for item in values if item is not None]
+    return [str(item) for item in values if item is not None]
     return [str(values)]
 
 # -------------------------
@@ -243,8 +242,7 @@ class FocusBranch:
         self.focus_ids = normalized_focus_ids
 
         if not isinstance(self.metadata, dict):
-            with silent_operation("Convert metadata to dict"):
-                self.metadata = dict(self.metadata or {})
+            self.metadata = dict(self.metadata or {})
             if not isinstance(self.metadata, dict):
                 self.metadata = {}
 

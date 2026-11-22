@@ -1,0 +1,51 @@
+focus_tree = {
+	id = modded_tree
+
+	# Mod-specific tree-level block the editor knows nothing about.
+	kaiserreich_metadata = {
+		branch = syndicalist
+		author = "someone { with } braces in their name"
+		weights = { 1 2 3 }
+	}
+
+	focus = {
+		id = modded_focus
+		x = 0
+		y = 0
+		cost = 10
+
+		# Unknown blocks: must survive in raw, be listed as unparsed, and be
+		# absent from clean_raw.
+		custom_mod_effect = {
+			do_something_odd = yes
+			nested = { deeper = { deepest = 1 } }
+		}
+
+		dynamic_modifier_block = {
+			modifier = custom_thing
+		}
+
+		# Known blocks around them must still map normally.
+		available = {
+			has_completed_focus = modded_prereq
+		}
+
+		completion_reward = {
+			add_political_power = 50
+		}
+	}
+
+	focus = {
+		id = modded_prereq
+		x = 2
+		y = 0
+		cost = 10
+	}
+
+	# Anonymous values inside a block, plus a bare nested block.
+	editor_hints = {
+		collapsed
+		pinned
+		{ 1 2 }
+	}
+}

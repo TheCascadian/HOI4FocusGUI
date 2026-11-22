@@ -329,11 +329,10 @@ def test_exporter_does_not_pull_in_the_facade_or_gui():
 def test_import_pipeline_does_not_pull_in_the_gui():
     """``_import_pipeline`` must not reach the GUI layer.
 
-    It does still reach ``_imports`` *transitively*, because its dependency
-    ``_txt_converter`` has not been converted to explicit imports yet -- that
-    module is outside the scope of this change. What matters here is that the
-    edge is one-way and terminates: ``_imports`` no longer imports
-    ``_txt_converter`` back at module scope, so there is no cycle.
+    Since the parser rewrite it does not reach ``_imports`` at all, even
+    transitively: ``_txt_converter`` now uses explicit imports and depends only
+    on the standard library plus ``_paradox_cst``/``_paradox_lexer``. The
+    ``_imports`` edge remains one-way and lazy, so there is no cycle either.
     """
     result = run_in_subprocess(
         """

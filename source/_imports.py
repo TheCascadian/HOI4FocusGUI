@@ -3,7 +3,7 @@
 STATUS: legacy. This module is retained only so that modules which have not yet
 been converted to explicit imports keep working. Do not add new dependents, and
 do not import it from ``_dataStructs``, ``_utils``, ``_exporter``, or
-``_import_pipeline`` — those modules now use explicit imports and importing this
+``_import_pipeline`` - those modules now use explicit imports and importing this
 facade from them would re-introduce the import cycle it used to paper over.
 
 This module acts as a centralized, well-documented imports facade for

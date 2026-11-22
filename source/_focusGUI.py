@@ -26,6 +26,16 @@ from _imports import (
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from PyQt6.QtWidgets import *
+from _project_document import (
+    DEFAULT_AUTOSAVE_KEEP,
+    DEFAULT_BACKUP_KEEP,
+    ProjectDocument,
+    ProjectDocumentError,
+    find_recovery_candidates,
+    load_document,
+    save_document,
+    save_rotating,
+)
 from _commands import (
     ColorizeNodesCommand,
     DeleteEventCommand,
@@ -62,49 +72,113 @@ from _dialog import (
     ProjectNoteSettingsDialog,
     IconLibraryDialog,
     SettingsDialog,
+    ProjectRecoveryDialog,
 )
 
-from _txt_converter import convert_txt_to_project_dict
+from _txt_converter import ParadoxSyntaxError, convert_txt_to_project_dict
 from _error_presenter import set_error_presenter
+from _dataStructs import FocusTree
+from _diagnostics_panel import DiagnosticsPanel
+from _validation import ValidationContext, ValidationResult
 
 
 StateViewportDock = None
-with silent_operation("import_StateViewportDock"):
-    from _state_viewport import StateViewportDock
+from _state_viewport import StateViewportDock
 _write_state_sidecar = None
-with silent_operation("import_write_state_sidecar"):
-    # helper for writing sidecar files with one-line-per-item formatting
-    from _state_viewport import _write_state_sidecar
+# helper for writing sidecar files with one-line-per-item formatting
+from _state_viewport import _write_state_sidecar
 
 Image = None
-with silent_operation("import_PIL_Image"):
-    from PIL import Image
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 GitHubUpdater = None
-with silent_operation("import_GitHubUpdater"):
-    from _updater import GitHubUpdater
+from _updater import GitHubUpdater
+
+
+def format_parse_diagnostics(records: List[dict]) -> str:
+    """Render parser diagnostics as reviewable text.
+
+    Each record already carries file, line, column, offending token, expected
+    construct and the surrounding source line, so this only has to lay them out.
+    """
+    blocks = []
+    for record in records:
+        head = (
+            f"{record.get('filename', '?')}:{record.get('line', 0)}:"
+            f"{record.get('column', 0)}: {record.get('severity', 'error')} "
+            f"[{record.get('code', 'unknown')}]"
+        )
+        lines = [head, f"  {record.get('message', '')}"]
+        if record.get('token'):
+            lines.append(f"  found: {record['token']}")
+        if record.get('expected'):
+            lines.append(f"  expected: {record['expected']}")
+        if record.get('context'):
+            lines.extend("  " + part for part in str(record['context']).split("\n"))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _show_parse_diagnostics(parent, records: List[dict], display_name: str,
+                            allow_continue: bool) -> bool:
+    """Show parser diagnostics; return True if the user wants to import anyway.
+
+    ``allow_continue`` is False when parsing bailed out entirely, in which case
+    there is nothing to import and the dialog is informational.
+    """
+    errors = [r for r in records if r.get('severity') == 'error']
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Import Problems")
+    layout = QVBoxLayout(dlg)
+    summary = QLabel(
+        f"{len(errors)} error(s) and {len(records) - len(errors)} warning(s) "
+        f"while parsing {display_name}."
+        + ("\n\nThe listed constructs were skipped or recovered. Import anyway?"
+           if allow_continue else "\n\nThe file could not be parsed.")
+    )
+    summary.setWordWrap(True)
+    layout.addWidget(summary)
+
+    detail = QPlainTextEdit(format_parse_diagnostics(records))
+    detail.setReadOnly(True)
+    detail.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    detail.setMinimumSize(640, 320)
+    layout.addWidget(detail)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        if allow_continue else QDialogButtonBox.StandardButton.Close
+    )
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+
+    return dlg.exec() == QDialog.DialogCode.Accepted and allow_continue
 
 #region Global UI safety patches
 # Disable the default QMainWindow toolbar/dock popup menu so users cannot hide
 # toolbars via right-click anywhere in the main window's toolbar area.
-with silent_operation("patch_QMainWindow_createPopupMenu"):
-    def _no_mainwindow_popup(self):
-        return None
-    QMainWindow.createPopupMenu = _no_mainwindow_popup  # type: ignore[attr-defined]
+def _no_mainwindow_popup(self):
+    return None
+QMainWindow.createPopupMenu = _no_mainwindow_popup  # type: ignore[attr-defined]
 #endregion
 
 # Performance decorators moved to _utils.py to avoid circular imports
 
 def atomic_write_json(target_path: str, payload: Any) -> None:
-    """Write JSON payload to target path atomically via temporary file rename."""
+    """Write JSON payload to target path atomically via temporary file rename.
+
+    Legacy raw-dict writer, kept for non-project sidecar JSON. Project files
+    go through _project_document.save_document(), which adds schema
+    versioning, validation, deterministic output and rotating backups.
+    """
     if not target_path:
         return
     directory = os.path.dirname(target_path)
     if directory:
-        with silent_operation("makedirs_for_atomic_write"):
-            os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, exist_ok=True)
     tmp_dir = directory if directory else None
     fd = None
     tmp_path = None
@@ -113,8 +187,7 @@ def atomic_write_json(target_path: str, payload: Any) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
             handle.flush()
-            with silent_operation("fsync_json_file"):
-                os.fsync(handle.fileno())
+            os.fsync(handle.fileno())
             fd = None  # fd already owned by handle
         os.replace(tmp_path, target_path)
     except Exception as exc:
@@ -129,14 +202,17 @@ def atomic_write_json(target_path: str, payload: Any) -> None:
                 os.close(fd)
 
 def write_rotating_autosave(base_path: str, payload: Any, keep: int) -> None:
-    """Write payload to base_path while maintaining up to `keep` rotating backups."""
+    """Write payload to base_path while maintaining up to `keep` rotating backups.
+
+    Legacy raw-dict autosave writer; project autosaves now use
+    _project_document.save_rotating().
+    """
     if not base_path:
         return
     keep = max(1, int(keep) if keep is not None else 1)
     directory = os.path.dirname(base_path)
     if directory:
-        with silent_operation("makedirs_for_autosave"):
-            os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, exist_ok=True)
     for idx in range(keep, 0, -1):
         src = base_path if idx == 1 else f"{base_path}.{idx-1}"
         dst = f"{base_path}.{idx}"
@@ -158,152 +234,74 @@ Includes a reusable Focus Library (dictionary) for saving/applying focus propert
 GITHUB_REPO_OWNER = os.environ.get("FOCUS_GITHUB_REPO_OWNER", "TheCascadian")
 GITHUB_REPO_NAME = os.environ.get("FOCUS_GITHUB_REPO_NAME", "HOI4FocusGUI")
 
-#region Mute App patch
-# Monkeypatch QMessageBox helpers so they respect an application-wide `muted` flag
-# When muted, show a lightweight custom dialog (no system notification sound) instead
-try:
-    _orig_qinformation = QMessageBox.information
-    _orig_qwarning = QMessageBox.warning
-    _orig_qcritical = QMessageBox.critical
-    _orig_qqestion = QMessageBox.question
+#region Mute App helpers
+# Explicit helper functions for showing dialogs while respecting `muted` without
+# monkeypatching Qt's QMessageBox class methods globally.
+def _map_qmb_to_qdb(qmb_button):
+    mapping = {
+        QMessageBox.StandardButton.Ok: QDialogButtonBox.StandardButton.Ok,
+        QMessageBox.StandardButton.Save: QDialogButtonBox.StandardButton.Save,
+        QMessageBox.StandardButton.Open: QDialogButtonBox.StandardButton.Open,
+        QMessageBox.StandardButton.Yes: QDialogButtonBox.StandardButton.Yes,
+        QMessageBox.StandardButton.No: QDialogButtonBox.StandardButton.No,
+        QMessageBox.StandardButton.Cancel: QDialogButtonBox.StandardButton.Cancel,
+        QMessageBox.StandardButton.Retry: QDialogButtonBox.StandardButton.Retry,
+        QMessageBox.StandardButton.Ignore: QDialogButtonBox.StandardButton.Ignore,
+        QMessageBox.StandardButton.Close: QDialogButtonBox.StandardButton.Close,
+        QMessageBox.StandardButton.Apply: QDialogButtonBox.StandardButton.Apply,
+        QMessageBox.StandardButton.Help: QDialogButtonBox.StandardButton.Help,
+    }
+    return mapping.get(qmb_button, None)
 
-    def _map_qmb_to_qdb(qmb_button):
-        # Map QMessageBox.StandardButton -> QDialogButtonBox.StandardButton where possible
-        mapping = {
-            QMessageBox.StandardButton.Ok: QDialogButtonBox.StandardButton.Ok,
-            QMessageBox.StandardButton.Save: QDialogButtonBox.StandardButton.Save,
-            QMessageBox.StandardButton.Open: QDialogButtonBox.StandardButton.Open,
-            QMessageBox.StandardButton.Yes: QDialogButtonBox.StandardButton.Yes,
-            QMessageBox.StandardButton.No: QDialogButtonBox.StandardButton.No,
-            QMessageBox.StandardButton.Cancel: QDialogButtonBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Retry: QDialogButtonBox.StandardButton.Retry,
-            QMessageBox.StandardButton.Ignore: QDialogButtonBox.StandardButton.Ignore,
-            QMessageBox.StandardButton.Close: QDialogButtonBox.StandardButton.Close,
-            QMessageBox.StandardButton.Apply: QDialogButtonBox.StandardButton.Apply,
-            QMessageBox.StandardButton.Help: QDialogButtonBox.StandardButton.Help,
-        }
-        return mapping.get(qmb_button, None)
-
-    def _silent_dialog(parent, title, text, buttons=QMessageBox.StandardButton.Ok, defaultButton=QMessageBox.StandardButton.No, modal=True):
-        try:
-            dlg = QDialog(parent)
-            dlg.setWindowTitle(str(title))
-            dlg.setModal(bool(modal))
-            layout = QVBoxLayout(dlg)
-            lbl = QLabel(str(text), dlg)
-            lbl.setWordWrap(True)
-            layout.addWidget(lbl)
-            # Build QDialogButtonBox with requested buttons
-            qdb_buttons = QDialogButtonBox.StandardButton(0)
-            # iterate known buttons in stable order
-            known = [QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No, QMessageBox.StandardButton.Retry, QMessageBox.StandardButton.Ignore, QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Close, QMessageBox.StandardButton.Apply]
-            for kb in known:
-                try:
-                    if int(buttons) & int(kb):
-                        mapped = _map_qmb_to_qdb(kb)
-                        if mapped is not None:
-                            qdb_buttons |= mapped
-                except Exception as e:
-                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-            # default to Ok if nothing mapped
-            if int(qdb_buttons) == 0:
-                qdb_buttons = QDialogButtonBox.StandardButton.Ok
-            box = QDialogButtonBox(qdb_buttons, parent=dlg)
-            layout.addWidget(box)
-
-            result_holder = {'res': QMessageBox.StandardButton.No}
-
-            def on_clicked(bt):
-                try:
-                    std = box.standardButton(bt)
-                    # map back to QMessageBox.StandardButton by name
-                    name = std.name if hasattr(std, 'name') else None
-                    # try to find a matching QMessageBox.StandardButton
-                    for candidate in QMessageBox.StandardButton:
-                        try:
-                            if candidate.name == name:
-                                result_holder['res'] = candidate
-                                break
-                        except Exception as e:
-                            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                except Exception as e:
-                    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                try:
-                    dlg.accept()
-                except Exception:
-                    try:
-                        dlg.close()
-                    except Exception as e:
-                        handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-
-            box.clicked.connect(on_clicked)
-            dlg.exec()
-            return result_holder['res']
-        except Exception:
-            # fallback: return a sensible default
+def _silent_dialog(parent, title, text, buttons=QMessageBox.StandardButton.Ok, defaultButton=QMessageBox.StandardButton.No, modal=True):
+    try:
+        dlg = QDialog(parent)
+        dlg.setWindowTitle(str(title))
+        dlg.setModal(bool(modal))
+        layout = QVBoxLayout(dlg)
+        lbl = QLabel(str(text), dlg)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        qdb_buttons = QDialogButtonBox.StandardButton(0)
+        known = [QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No, QMessageBox.StandardButton.Retry, QMessageBox.StandardButton.Ignore, QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Close, QMessageBox.StandardButton.Apply]
+        for kb in known:
             try:
-                return defaultButton
+                if int(buttons) & int(kb):
+                    mapped = _map_qmb_to_qdb(kb)
+                    if mapped is not None:
+                        qdb_buttons |= mapped
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        if int(qdb_buttons) == 0:
+            qdb_buttons = QDialogButtonBox.StandardButton.Ok
+        box = QDialogButtonBox(qdb_buttons, parent=dlg)
+        layout.addWidget(box)
+        result_holder = {'res': QMessageBox.StandardButton.No}
+        def on_clicked(bt):
+            try:
+                std = box.standardButton(bt)
+                name = std.name if hasattr(std, 'name') else None
+                for candidate in QMessageBox.StandardButton:
+                    if candidate.name == name:
+                        result_holder['res'] = candidate
+                        break
+            except Exception as e:
+                handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            try:
+                dlg.accept()
             except Exception:
-                return QMessageBox.StandardButton.No
+                dlg.close()
+        box.clicked.connect(on_clicked)
+        dlg.exec()
+        return result_holder['res']
+    except Exception:
+        return defaultButton
 
-    def _wrap_info(*args, **kwargs):
-        try:
-            parent = args[0] if args else kwargs.get('parent', None)
-            title = args[1] if len(args) > 1 else kwargs.get('title', '')
-            text = args[2] if len(args) > 2 else kwargs.get('text', '')
-            buttons = args[3] if len(args) > 3 else kwargs.get('buttons', QMessageBox.StandardButton.Ok)
-            default = args[4] if len(args) > 4 else kwargs.get('defaultButton', QMessageBox.StandardButton.No)
-            if getattr(parent, 'muted', False):
-                return _silent_dialog(parent, title, text, buttons=buttons, defaultButton=default)
-            return _orig_qinformation(*args, **kwargs)
-        except Exception:
-            return _orig_qinformation(*args, **kwargs)
-
-    def _wrap_warn(*args, **kwargs):
-        try:
-            parent = args[0] if args else kwargs.get('parent', None)
-            title = args[1] if len(args) > 1 else kwargs.get('title', '')
-            text = args[2] if len(args) > 2 else kwargs.get('text', '')
-            buttons = args[3] if len(args) > 3 else kwargs.get('buttons', QMessageBox.StandardButton.Ok)
-            default = args[4] if len(args) > 4 else kwargs.get('defaultButton', QMessageBox.StandardButton.No)
-            if getattr(parent, 'muted', False):
-                return _silent_dialog(parent, title, text, buttons=buttons, defaultButton=default)
-            return _orig_qwarning(*args, **kwargs)
-        except Exception:
-            return _orig_qwarning(*args, **kwargs)
-
-    def _wrap_crit(*args, **kwargs):
-        try:
-            parent = args[0] if args else kwargs.get('parent', None)
-            title = args[1] if len(args) > 1 else kwargs.get('title', '')
-            text = args[2] if len(args) > 2 else kwargs.get('text', '')
-            buttons = args[3] if len(args) > 3 else kwargs.get('buttons', QMessageBox.StandardButton.Ok)
-            default = args[4] if len(args) > 4 else kwargs.get('defaultButton', QMessageBox.StandardButton.No)
-            if getattr(parent, 'muted', False):
-                return _silent_dialog(parent, title, text, buttons=buttons, defaultButton=default)
-            return _orig_qcritical(*args, **kwargs)
-        except Exception:
-            return _orig_qcritical(*args, **kwargs)
-
-    def _wrap_question(*args, **kwargs):
-        try:
-            parent = args[0] if args else kwargs.get('parent', None)
-            title = args[1] if len(args) > 1 else kwargs.get('title', '')
-            text = args[2] if len(args) > 2 else kwargs.get('text', '')
-            buttons = args[3] if len(args) > 3 else kwargs.get('buttons', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            default = args[4] if len(args) > 4 else kwargs.get('defaultButton', QMessageBox.StandardButton.No)
-            if getattr(parent, 'muted', False):
-                return _silent_dialog(parent, title, text, buttons=buttons, defaultButton=default)
-            return _orig_qqestion(*args, **kwargs)
-        except Exception:
-            return _orig_qqestion(*args, **kwargs)
-
-    QMessageBox.information = _wrap_info
-    QMessageBox.warning = _wrap_warn
-    QMessageBox.critical = _wrap_crit
-    QMessageBox.question = _wrap_question
-except Exception as e:
-    handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+def show_message_box(kind: str, parent, title, text, buttons=QMessageBox.StandardButton.Ok, defaultButton=QMessageBox.StandardButton.No):
+    if getattr(parent, 'muted', False):
+        return _silent_dialog(parent, title, text, buttons=buttons, defaultButton=defaultButton)
+    fn = getattr(QMessageBox, kind, QMessageBox.information)
+    return fn(parent, title, text, buttons, defaultButton)
 
 #endregion
 
@@ -371,7 +369,7 @@ class GameStateDock(QDockWidget):
             title = getattr(f, 'name', '') if hasattr(f, 'name') else f.get('name', '') if isinstance(f, dict) else ''
             if not fid:
                 continue
-            it = QListWidgetItem(f"{fid} — {title}")
+            it = QListWidgetItem(f"{fid} - {title}")
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(Qt.CheckState.Checked if fid in self.completed else Qt.CheckState.Unchecked)
             # store id
@@ -394,16 +392,14 @@ class GameStateDock(QDockWidget):
             self.completed.add(fid)
         else:
             self.completed.discard(fid)
-        with silent_operation("emit_state_changed"):
-            self.state_changed.emit()
+        self.state_changed.emit()
 
     def _on_clear(self):
         self.completed.clear()
         for i in range(self.list.count()):
             it = self.list.item(i)
             it.setCheckState(Qt.CheckState.Unchecked)
-        with silent_operation("emit_state_changed"):
-            self.state_changed.emit()
+        self.state_changed.emit()
 
     def _on_check_all(self):
         self.completed = set()
@@ -412,8 +408,7 @@ class GameStateDock(QDockWidget):
             fid = it.data(Qt.ItemDataRole.UserRole)
             self.completed.add(fid)
             it.setCheckState(Qt.CheckState.Checked)
-        with silent_operation("emit_state_changed"):
-            self.state_changed.emit()
+        self.state_changed.emit()
 
     def is_completed(self, focus_id: str) -> bool:
         return str(focus_id) in self.completed
@@ -461,11 +456,10 @@ class KeybindsManager(QObject): # Keybindings: manager and editor
         parented on the provided widget so it only triggers when that widget (or its
         children) has focus.
         """
-        with silent_operation("register_scope_widget"):
-            if name and widget is not None:
-                self._scope_widgets[name] = widget
-                # Rebuild so any commands that requested this scope become active
-                self._rebuild_shortcuts()
+        if name and widget is not None:
+            self._scope_widgets[name] = widget
+            # Rebuild so any commands that requested this scope become active
+            self._rebuild_shortcuts()
 
     def register_commands(self, commands: List[CommandSpec]) -> None:
         for spec in commands:
@@ -480,8 +474,7 @@ class KeybindsManager(QObject): # Keybindings: manager and editor
             return
         # destroy old
         if spec.qshortcut is not None:
-            with silent_operation("disconnect_qshortcut"):
-                spec.qshortcut.activated.disconnect()
+            spec.qshortcut.activated.disconnect()
             spec.qshortcut.setParent(None)
             spec.qshortcut.deleteLater()
             spec.qshortcut = None
@@ -509,24 +502,20 @@ class KeybindsManager(QObject): # Keybindings: manager and editor
         # If parent is a scope widget, use WidgetWithChildrenShortcut so it only
         # triggers when that widget (or child) has focus. Otherwise default to
         # ApplicationShortcut for global bindings.
-        with silent_operation("set_shortcut_context"):
-            if parent_widget is not None and getattr(spec, 'widget_scope', None):
-                sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            else:
-                sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        if parent_widget is not None and getattr(spec, 'widget_scope', None):
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        else:
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
         sc.activated.connect(lambda s=spec: self._invoke(s))
         spec.qshortcut = sc
 
     def _remove_qshortcut(self, spec: CommandSpec) -> None:
         """Remove any live QShortcut for this spec."""
-        with silent_operation("remove_qshortcut"):
-            if spec.qshortcut is not None:
-                with silent_operation("disconnect_qshortcut"):
-                    spec.qshortcut.activated.disconnect()
-                with silent_operation("delete_qshortcut"):
-                    spec.qshortcut.setParent(None)
-                    spec.qshortcut.deleteLater()
-                spec.qshortcut = None
+        if spec.qshortcut is not None:
+            spec.qshortcut.activated.disconnect()
+            spec.qshortcut.setParent(None)
+            spec.qshortcut.deleteLater()
+            spec.qshortcut = None
 
     def _normalized_seq(self, seq_str: Optional[str]) -> Optional[str]:
         if not seq_str:
@@ -572,21 +561,18 @@ class KeybindsManager(QObject): # Keybindings: manager and editor
             wspec = self._commands.get(winner)
             if wspec:
                 # Ensure winner uses the normalized string to avoid platform diffs
-                with silent_operation("set_winner_shortcut"):
-                    wspec.shortcut = nseq if wspec.shortcut else wspec.shortcut
+                wspec.shortcut = nseq if wspec.shortcut else wspec.shortcut
                 self._create_or_update_qshortcut(wspec)
             # Losers remain without QShortcuts (already removed above)
 
         # Emit change signal so any UI can refresh conflict highlighting
-        with silent_operation("emit_keybinds_changed"):
-            self.keybinds_changed.emit()
+        self.keybinds_changed.emit()
 
     def _invoke(self, spec: CommandSpec) -> None:
         try:
             spec.callback()
         except Exception as e:
-            with silent_operation("show_keybind_error"):
-                show_error(self._owner_widget, "Keybind Error", f"Failed to execute action '{spec.label}'.", e)
+            show_error(self._owner_widget, "Keybind Error", f"Failed to execute action '{spec.label}'.", e)
 
     def list_commands(self) -> List[CommandSpec]:
         return list(sorted(self._commands.values(), key=lambda s: s.label.lower()))
@@ -689,8 +675,7 @@ class KeybindsEditorDialog(EditorDialogBase):
                 ed = QKeySequenceEdit(self)
                 seq_str = spec.shortcut or spec.default or ""
                 if seq_str:
-                    with silent_operation("set_key_sequence"):
-                        ed.setKeySequence(QKeySequence(seq_str))
+                    ed.setKeySequence(QKeySequence(seq_str))
                 # connect editingFinished to handler
                 ed.editingFinished.connect(lambda cid=spec.cid, w=ed: self._on_seq_changed(cid, w))
                 self.tree.setItemWidget(child, 1, ed)
@@ -715,10 +700,9 @@ class KeybindsEditorDialog(EditorDialogBase):
         btns.addWidget(reset_all)
         btns.addWidget(close_btn)
         layout.addLayout(btns)
-        with silent_operation("init_conflict_styles"):
-            # Update conflict highlighting initially and when manager mapping changes
-            self._refresh_conflict_styles()
-            self.manager.keybinds_changed.connect(self._refresh_conflict_styles)
+        # Update conflict highlighting initially and when manager mapping changes
+        self._refresh_conflict_styles()
+        self.manager.keybinds_changed.connect(self._refresh_conflict_styles)
 
     def _on_seq_changed(self, cid: str, widget: 'QKeySequenceEdit') -> None:
         seq = widget.keySequence()
@@ -751,12 +735,11 @@ class KeybindsEditorDialog(EditorDialogBase):
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         # clear backgrounds and widget styles
         def _clear_styles(node: QTreeWidgetItem):
-            with silent_operation("clear_tree_styles"):
-                for col in range(self.tree.columnCount()):
-                    node.setBackground(col, QBrush())
-                w = self.tree.itemWidget(node, 1)
-                if w:
-                    w.setStyleSheet("")
+            for col in range(self.tree.columnCount()):
+                node.setBackground(col, QBrush())
+            w = self.tree.itemWidget(node, 1)
+            if w:
+                w.setStyleSheet("")
 
         # iterate categories and children
         root = self.tree.invisibleRootItem()
@@ -844,10 +827,9 @@ class ErrorDialog(EditorDialogBase): # Central error reporting dialog with copy 
         copy_btn = QPushButton("Copy Details")
         close_btn = QPushButton("Close")
         def _copy():
-            with silent_operation("copy_error_to_clipboard"):
-                diag = details if details else message
-                if diag:
-                    QApplication.clipboard().setText(obfuscate_text(diag))
+            diag = details if details else message
+            if diag:
+                QApplication.clipboard().setText(obfuscate_text(diag))
         copy_btn.clicked.connect(_copy)
         close_btn.clicked.connect(self.accept)
         btns.addStretch(1)
@@ -898,15 +880,14 @@ class KeybindsOverlay(QWidget):
         self._pinned = False
 
     def show_overlay(self, duration_ms: int = 5000):
-        with silent_operation("show_keybinds_overlay"):
-            self._list.clear()
-            for spec in sorted(self.manager.list_commands(), key=lambda s: (s.category or 'ZZZ', s.label.lower())):
-                seq = spec.shortcut or spec.default or ''
-                if seq:
-                    self._list.addItem(f"{spec.category or 'General'}: {spec.label} — {seq}")
-            self.adjustSize()
-            self.show()
-            self._timeout.start(duration_ms)
+        self._list.clear()
+        for spec in sorted(self.manager.list_commands(), key=lambda s: (s.category or 'ZZZ', s.label.lower())):
+            seq = spec.shortcut or spec.default or ''
+            if seq:
+                self._list.addItem(f"{spec.category or 'General'}: {spec.label} - {seq}")
+        self.adjustSize()
+        self.show()
+        self._timeout.start(duration_ms)
 
     def toggle_overlay(self):
         if self.isVisible():
@@ -934,8 +915,7 @@ SCENE_HALF = 60000 # Scene half-extent in pixels. Increase significantly to allo
 # Module-level compatibility alias for older code/tests that import `NoteItem`.
 # Placed at module scope so `from _focusGUI import NoteItem` works reliably.
 NoteItem = None
-with silent_operation("alias_NoteItem"):
-    NoteItem = NoteNode
+NoteItem = NoteNode
 
 
 
@@ -1110,8 +1090,7 @@ class FocusTreeCanvas(QGraphicsScene):
         # Use a spatial index (BSP tree) where available so the scene can
         # efficiently query items inside the viewport instead of iterating
         # all items on every paint. Fall back to NoIndex if not supported.
-        with silent_operation("set_bsp_index"):
-            self.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.BspTreeIndex)
+        self.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.BspTreeIndex)
 
         # Viewport culling: maintain a short-timed cull operation that hides
         # items outside an extended viewport margin to avoid painting and
@@ -1441,7 +1420,7 @@ class FocusTreeCanvas(QGraphicsScene):
             'icon_supersample_scale': float(getattr(self, 'icon_supersample_scale', 1.0)),
             'mutex_icon_supersample_scale': float(getattr(self, 'mutex_icon_supersample_scale', 1.0)),
             'mutex_icon_display_scale': float(getattr(self, 'mutex_icon_display_scale', 1.0)),
-            'default_focus_color': self.default_focus_color.name() if isinstance(self.default_focus_color, QColor) else None,
+            'default_focus_color': getattr(self, 'default_focus_color', None).name() if isinstance(getattr(self, 'default_focus_color', None), QColor) else None,
             'undo_limit': int(getattr(self, 'undo_limit', 100)),
             'focus_color_overrides': foc_over,
             'notes_enabled': bool(getattr(self, 'notes_enabled', False)),
@@ -1720,53 +1699,65 @@ class FocusTreeCanvas(QGraphicsScene):
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
     def draw_grid(self):
-        """Draw a grid background"""
-        # Remove existing grid lines (if any) to avoid duplication
+        """Refresh the grid background (drawn dynamically in drawBackground)."""
+        # Remove any legacy QGraphicsLineItem grid items from the scene
         for item in list(self.items()):
-            # preserve FocusNode and connection lines only; remove simple QGraphicsLineItem grid
             if isinstance(item, QGraphicsLineItem):
                 self.removeItem(item)
+        self.update()
 
+    def drawBackground(self, painter: QPainter, rect: QRectF):
+        """Draw only the visible grid lines inside rect for fast, artifact-free panning/zooming."""
+        super().drawBackground(painter, rect)
         if not getattr(self, '_grid_visible', True):
             return
-
-        pen = QPen(QColor(200, 200, 200), 0.5, Qt.PenStyle.DotLine)
-        major_pen = QPen(QColor(150, 150, 150), 1, Qt.PenStyle.DotLine)
-        # Minor grid lines (every GRID_UNIT) and major grid lines every few units
         step = int(GRID_UNIT)
+        if step <= 0:
+            return
         major_step = step * 5
-        left = int(-SCENE_HALF)
-        right = int(SCENE_HALF)
-        for x in range(left, right + 1, step):
-            line_pen = major_pen if (x - left) % major_step == 0 else pen
-            li = self.addLine(x, -SCENE_HALF, x, SCENE_HALF, line_pen)
-            with silent_operation("set_grid_line_zvalue"):
-                li.setZValue(self.z_grid)
-        for y in range(left, right + 1, step):
-            line_pen = major_pen if (y - left) % major_step == 0 else pen
-            li = self.addLine(-SCENE_HALF, y, SCENE_HALF, y, line_pen)
-            with silent_operation("set_grid_line_zvalue"):
-                li.setZValue(self.z_grid)
+        left = max(-SCENE_HALF, int(rect.left() // step) * step)
+        right = min(SCENE_HALF, int(rect.right()) + step)
+        top = max(-SCENE_HALF, int(rect.top() // step) * step)
+        bottom = min(SCENE_HALF, int(rect.bottom()) + step)
+        # Skip minor lines when zoomed far out so grid doesn't moire or bog down
+        views = self.views()
+        zoom = views[0].transform().m11() if views else 1.0
+        draw_minor = (step * zoom) >= 12.0
+        minor_pen = QPen(QColor(110, 110, 110, 45), 0)
+        major_pen = QPen(QColor(125, 125, 125, 75), 0)
+        painter.save()
+        try:
+            for x in range(left, right + 1, step):
+                is_major = (x % major_step == 0)
+                if not is_major and not draw_minor:
+                    continue
+                painter.setPen(major_pen if is_major else minor_pen)
+                painter.drawLine(x, top, x, bottom)
+            for y in range(top, bottom + 1, step):
+                is_major = (y % major_step == 0)
+                if not is_major and not draw_minor:
+                    continue
+                painter.setPen(major_pen if is_major else minor_pen)
+                painter.drawLine(left, y, right, y)
+        finally:
+            painter.restore()
 
     def schedule_cull(self, delay_ms: Optional[int] = None) -> None:
         """Schedule a cull pass shortly (throttled).
 
         delay_ms: optional custom delay in milliseconds.
         """
-        with silent_operation("schedule_cull"):
-            # Skip culling for small scenes or when disabled
-            if not getattr(self, 'culling_enabled', True):
-                return
-            with silent_operation("check_cull_thresholds"):
-                if len(getattr(self, 'nodes', {}) or {}) < getattr(self, 'culling_min_nodes', 0) and \
-                   len(getattr(self, 'connections', []) or []) < getattr(self, 'culling_min_connections', 0):
-                    return
-            if delay_ms is not None:
-                with silent_operation("set_cull_interval"):
-                    self._cull_timer.setInterval(int(delay_ms))
-            if self._cull_timer.isActive():
-                self._cull_timer.stop()
-            self._cull_timer.start()
+        # Skip culling for small scenes or when disabled
+        if not getattr(self, 'culling_enabled', True):
+            return
+        if len(getattr(self, 'nodes', {}) or {}) < getattr(self, 'culling_min_nodes', 0) and \
+           len(getattr(self, 'connections', []) or []) < getattr(self, 'culling_min_connections', 0):
+            return
+        if delay_ms is not None:
+            self._cull_timer.setInterval(int(delay_ms))
+        if self._cull_timer.isActive():
+            self._cull_timer.stop()
+        self._cull_timer.start()
 
     def _check_and_invalidate_scaling_cache(self) -> None:
         """Force node updates when zoom changes and dynamic scaling is active.
@@ -1774,28 +1765,26 @@ class FocusTreeCanvas(QGraphicsScene):
         Since nodes use NoCache mode for dynamic scaling, we just need to trigger
         updates to force fresh rendering with the new scale factor.
         """
-        with silent_operation("check_scaling_cache"):
-            # Only check if dynamic scaling is enabled
-            if not bool(getattr(self, 'enable_dynamic_title_icon_scaling', True)):
-                return
+        # Only check if dynamic scaling is enabled
+        if not bool(getattr(self, 'enable_dynamic_title_icon_scaling', True)):
+            return
 
-            # Get current zoom scale
-            views = self.views()
-            if not views:
-                return
+        # Get current zoom scale
+        views = self.views()
+        if not views:
+            return
 
-            current_zoom = views[0].transform().m11()
+        current_zoom = views[0].transform().m11()
 
-            last_zoom = float(getattr(self, '_last_zoom_scale', 1.0))
+        last_zoom = float(getattr(self, '_last_zoom_scale', 1.0))
 
-            # Store current zoom for next check
-            self._last_zoom_scale = current_zoom
+        # Store current zoom for next check
+        self._last_zoom_scale = current_zoom
 
-            # If zoom changed by any amount, trigger updates for all visible nodes
-            if abs(current_zoom - last_zoom) > 0.001:
-                # Trigger viewport update to force fresh render with new scale
-                with silent_operation("update_viewport"):
-                    views[0].viewport().update()
+        # If zoom changed by any amount, trigger updates for all visible nodes
+        if abs(current_zoom - last_zoom) > 0.001:
+            # Trigger viewport update to force fresh render with new scale
+            views[0].viewport().update()
 
     def _perform_cull(self) -> None:
         """Perform viewport culling: hide/show nodes and connections based on
@@ -2069,29 +2058,23 @@ class FocusTreeCanvas(QGraphicsScene):
             width = int(d.get('connection_width', 2))
             ln = NoteConnectionLine(a, b, col, width)
             self.addItem(ln)
-            with silent_operation("set_note_connection_zvalue"):
-                ln.setZValue(self.z_connections)
+            ln.setZValue(self.z_connections)
             self._note_connections.append(ln)
-            with silent_operation("register_note_connection"):
-                a._register_note_connection(ln)
-                b._register_note_connection(ln)
+            a._register_note_connection(ln)
+            b._register_note_connection(ln)
             return ln
         except Exception:
             return None
 
     def remove_note_connections_for(self, note: 'NoteNode') -> None:
-        with silent_operation("remove_note_connections_for"):
-            for ln in list(self._note_connections):
-                if ln.a is note or ln.b is note:
-                    with silent_operation("remove_note_connection_item"):
-                        self.removeItem(ln)
-                    with silent_operation("unregister_note_connection"):
-                        if hasattr(ln.a, '_unregister_note_connection'):
-                            ln.a._unregister_note_connection(ln)
-                        if hasattr(ln.b, '_unregister_note_connection'):
-                            ln.b._unregister_note_connection(ln)
-                    with silent_operation("remove_from_note_connections"):
-                        self._note_connections.remove(ln)
+        for ln in list(self._note_connections):
+            if ln.a is note or ln.b is note:
+                self.removeItem(ln)
+                if hasattr(ln.a, '_unregister_note_connection'):
+                    ln.a._unregister_note_connection(ln)
+                if hasattr(ln.b, '_unregister_note_connection'):
+                    ln.b._unregister_note_connection(ln)
+                self._note_connections.remove(ln)
 
     # Note > Focus link management
     def add_note_focus_link(self, note: 'NoteNode', focus_node: 'FocusNode') -> Optional['NoteFocusConnector']:
@@ -2108,15 +2091,12 @@ class FocusTreeCanvas(QGraphicsScene):
             nf = NoteFocusConnector(note, focus_node, col, width)
             nf.setVisible(self.notes_enabled)
             self.addItem(nf)
-            with silent_operation("set_note_focus_zvalue"):
-                nf.setZValue(self.z_connections)
+            nf.setZValue(self.z_connections)
             self._note_focus_links.append(nf)
-            with silent_operation("register_note_focus_connector"):
-                if hasattr(note, '_note_focus_connectors') and nf not in note._note_focus_connectors:
-                    note._note_focus_connectors.append(nf)
-            with silent_operation("register_focus_note_connector"):
-                if hasattr(focus_node, 'note_focus_connectors') and nf not in focus_node.note_focus_connectors:
-                    focus_node.note_focus_connectors.append(nf)
+            if hasattr(note, '_note_focus_connectors') and nf not in note._note_focus_connectors:
+                note._note_focus_connectors.append(nf)
+            if hasattr(focus_node, 'note_focus_connectors') and nf not in focus_node.note_focus_connectors:
+                focus_node.note_focus_connectors.append(nf)
             return nf
         except Exception:
             return None
@@ -2129,14 +2109,11 @@ class FocusTreeCanvas(QGraphicsScene):
                         self.removeItem(nf)
                     except Exception as e:
                         handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                    with silent_operation("remove_note_focus_link"):
-                        self._note_focus_links.remove(nf)
-                    with silent_operation("unregister_note_focus_from_note"):
-                        if hasattr(nf.note, '_note_focus_connectors') and nf in nf.note._note_focus_connectors:
-                            nf.note._note_focus_connectors.remove(nf)
-                    with silent_operation("unregister_note_focus_from_focus"):
-                        if hasattr(nf.focus_node, 'note_focus_connectors') and nf in nf.focus_node.note_focus_connectors:
-                            nf.focus_node.note_focus_connectors.remove(nf)
+                    self._note_focus_links.remove(nf)
+                    if hasattr(nf.note, '_note_focus_connectors') and nf in nf.note._note_focus_connectors:
+                        nf.note._note_focus_connectors.remove(nf)
+                    if hasattr(nf.focus_node, 'note_focus_connectors') and nf in nf.focus_node.note_focus_connectors:
+                        nf.focus_node.note_focus_connectors.remove(nf)
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
@@ -2155,33 +2132,25 @@ class FocusTreeCanvas(QGraphicsScene):
             # Note↔Event links are part of the notes feature; follow notes visibility
             ne.setVisible(self.notes_enabled)
             self.addItem(ne)
-            with silent_operation("set_note_event_zvalue"):
-                ne.setZValue(self.z_connections)
+            ne.setZValue(self.z_connections)
             self._note_event_links.append(ne)
-            with silent_operation("register_note_event_on_note"):
-                if hasattr(note, '_note_event_connectors') and ne not in note._note_event_connectors:
-                    note._note_event_connectors.append(ne)
-            with silent_operation("register_note_event_on_event"):
-                if hasattr(event_node, 'note_event_connectors') and ne not in event_node.note_event_connectors:
-                    event_node.note_event_connectors.append(ne)
+            if hasattr(note, '_note_event_connectors') and ne not in note._note_event_connectors:
+                note._note_event_connectors.append(ne)
+            if hasattr(event_node, 'note_event_connectors') and ne not in event_node.note_event_connectors:
+                event_node.note_event_connectors.append(ne)
             return ne
         except Exception:
             return None
 
     def remove_note_event_links_for(self, obj) -> None:
-        with silent_operation("remove_note_event_links_for"):
-            for ne in list(getattr(self, '_note_event_links', [])):
-                if getattr(ne, 'note', None) is obj or getattr(ne, 'event_node', None) is obj:
-                    with silent_operation("remove_note_event_item"):
-                        self.removeItem(ne)
-                    with silent_operation("remove_from_note_event_links"):
-                        self._note_event_links.remove(ne)
-                    with silent_operation("unregister_note_event_from_note"):
-                        if hasattr(ne.note, '_note_event_connectors') and ne in ne.note._note_event_connectors:
-                            ne.note._note_event_connectors.remove(ne)
-                    with silent_operation("unregister_note_event_from_event"):
-                        if hasattr(ne.event_node, 'note_event_connectors') and ne in ne.event_node.note_event_connectors:
-                            ne.event_node.note_event_connectors.remove(ne)
+        for ne in list(getattr(self, '_note_event_links', [])):
+            if getattr(ne, 'note', None) is obj or getattr(ne, 'event_node', None) is obj:
+                self.removeItem(ne)
+                self._note_event_links.remove(ne)
+                if hasattr(ne.note, '_note_event_connectors') and ne in ne.note._note_event_connectors:
+                    ne.note._note_event_connectors.remove(ne)
+                if hasattr(ne.event_node, 'note_event_connectors') and ne in ne.event_node.note_event_connectors:
+                    ne.event_node.note_event_connectors.remove(ne)
 
     # Event <> Focus link management
     def add_event_focus_link(self, event_node: 'EventNode', focus_node: 'FocusNode') -> Optional['EventFocusConnector']:
@@ -2198,15 +2167,12 @@ class FocusTreeCanvas(QGraphicsScene):
             # Event↔Focus links are not notes; keep them always visible (independent of notes toggle)
             ef.setVisible(True)
             self.addItem(ef)
-            with silent_operation("set_event_focus_zvalue"):
-                ef.setZValue(self.z_connections)
+            ef.setZValue(self.z_connections)
             self._event_focus_links.append(ef)
-            with silent_operation("register_event_focus_on_event"):
-                if hasattr(event_node, 'event_focus_connectors') and ef not in event_node.event_focus_connectors:
-                    event_node.event_focus_connectors.append(ef)
-            with silent_operation("register_event_focus_on_focus"):
-                if hasattr(focus_node, 'event_focus_connectors') and ef not in focus_node.event_focus_connectors:
-                    focus_node.event_focus_connectors.append(ef)
+            if hasattr(event_node, 'event_focus_connectors') and ef not in event_node.event_focus_connectors:
+                event_node.event_focus_connectors.append(ef)
+            if hasattr(focus_node, 'event_focus_connectors') and ef not in focus_node.event_focus_connectors:
+                focus_node.event_focus_connectors.append(ef)
             # Inject a simple country_event call into the focus completion_reward so GUI shows the event
             try:
                 fobj = getattr(focus_node, 'focus', None)
@@ -2262,19 +2228,14 @@ class FocusTreeCanvas(QGraphicsScene):
             return None
 
     def remove_event_focus_links_for(self, obj) -> None:
-        with silent_operation("remove_event_focus_links_for"):
-            for ef in list(getattr(self, '_event_focus_links', [])):
-                if getattr(ef, 'event_node', None) is obj or getattr(ef, 'focus_node', None) is obj:
-                    with silent_operation("remove_event_focus_item"):
-                        self.removeItem(ef)
-                    with silent_operation("remove_from_event_focus_links"):
-                        self._event_focus_links.remove(ef)
-                    with silent_operation("unregister_event_focus_from_event"):
-                        if hasattr(ef.event_node, 'event_focus_connectors') and ef in ef.event_node.event_focus_connectors:
-                            ef.event_node.event_focus_connectors.remove(ef)
-                    with silent_operation("unregister_event_focus_from_focus"):
-                        if hasattr(ef.focus_node, 'event_focus_connectors') and ef in ef.focus_node.event_focus_connectors:
-                            ef.focus_node.event_focus_connectors.remove(ef)
+        for ef in list(getattr(self, '_event_focus_links', [])):
+            if getattr(ef, 'event_node', None) is obj or getattr(ef, 'focus_node', None) is obj:
+                self.removeItem(ef)
+                self._event_focus_links.remove(ef)
+                if hasattr(ef.event_node, 'event_focus_connectors') and ef in ef.event_node.event_focus_connectors:
+                    ef.event_node.event_focus_connectors.remove(ef)
+                if hasattr(ef.focus_node, 'event_focus_connectors') and ef in ef.focus_node.event_focus_connectors:
+                    ef.focus_node.event_focus_connectors.remove(ef)
 
     # Event <> Event link management
     def add_event_event_link(self, a: 'EventNode', b: 'EventNode') -> Optional['EventEventConnector']:
@@ -2292,15 +2253,12 @@ class FocusTreeCanvas(QGraphicsScene):
             ee = EventEventConnector(a, b, col, width)
             ee.setVisible(self.notes_enabled)
             self.addItem(ee)
-            with silent_operation("set_event_event_zvalue"):
-                ee.setZValue(self.z_connections)
+            ee.setZValue(self.z_connections)
             self._event_event_links.append(ee)
-            with silent_operation("register_event_event_on_a"):
-                if hasattr(a, 'event_event_connectors') and ee not in a.event_event_connectors:
-                    a.event_event_connectors.append(ee)
-            with silent_operation("register_event_event_on_b"):
-                if hasattr(b, 'event_event_connectors') and ee not in b.event_event_connectors:
-                    b.event_event_connectors.append(ee)
+            if hasattr(a, 'event_event_connectors') and ee not in a.event_event_connectors:
+                a.event_event_connectors.append(ee)
+            if hasattr(b, 'event_event_connectors') and ee not in b.event_event_connectors:
+                b.event_event_connectors.append(ee)
             return ee
         except Exception:
             return None
@@ -2470,12 +2428,11 @@ class FocusTreeCanvas(QGraphicsScene):
 
     def set_grid_visible(self, visible: bool) -> None:
         """Toggle grid visibility and redraw if needed."""
-        with silent_operation("set_grid_visible"):
-            vis = bool(visible)
-            if getattr(self, '_grid_visible', True) == vis:
-                return
-            self._grid_visible = vis
-            self.draw_grid()
+        vis = bool(visible)
+        if getattr(self, '_grid_visible', True) == vis:
+            return
+        self._grid_visible = vis
+        self.draw_grid()
 
     def compute_palette_for_networks(self, network_ids: List[int], seed: Optional[int] = None) -> None:
         """Compute and set `network_colors` for the given network ids.
@@ -2604,21 +2561,22 @@ class FocusTreeCanvas(QGraphicsScene):
             raise
 
     def sync_focus_positions(self) -> None:
-        """Ensure each Focus object's x/y reflect its node's actual scene position.
-
-        This rounds scene coordinates to the nearest GRID_UNIT grid cell and writes
-        the values back into the Focus dataclass so save/export routines read the
-        latest positions from the model.
-        """
-        with silent_operation("sync_focus_positions"):
-            for fid, node in list(self.nodes.items()):
-                with silent_operation("sync_single_focus_position"):
-                    pos = node.scenePos()
-                    gx = round(pos.x() / GRID_UNIT)
-                    gy = round(pos.y() / GRID_UNIT)
-                    if hasattr(node, 'focus') and node.focus is not None:
-                        node.focus.x = int(gx)
-                        node.focus.y = int(gy)
+        """Reconcile Focus model positions and canvas node registry as a single source of truth."""
+        parent_focuses = getattr(self.parent, 'focuses', None) if getattr(self, 'parent', None) is not None else None
+        seen_ids = set()
+        for fid, node in list(self.nodes.items()):
+            pos = node.scenePos()
+            gx = round(pos.x() / GRID_UNIT)
+            gy = round(pos.y() / GRID_UNIT)
+            fobj = getattr(node, 'focus', None)
+            if fobj is not None:
+                fobj.x = int(gx)
+                fobj.y = int(gy)
+                seen_ids.add(fobj.id)
+                if isinstance(parent_focuses, list) and fobj not in parent_focuses:
+                    parent_focuses.append(fobj)
+        if isinstance(parent_focuses, list):
+            self.parent.focuses = [f for f in parent_focuses if getattr(f, 'id', None) in seen_ids]
 
     # -------------------------
     # Frame management
@@ -2912,17 +2870,16 @@ class FocusTreeCanvas(QGraphicsScene):
 
     def schedule_frame_update(self):
         """Start or restart the frame update timer to throttle updates while dragging."""
-        with silent_operation("schedule_frame_update"):
-            if not self.frames_enabled:
-                return
-            if getattr(self, '_frames_transition_in_progress', False):
-                # suppress scheduling while a transition (enable/disable frames) is in progress
-                return
-            # mark frames dirty so the timer callback will rebuild them
-            self._frames_dirty = True
-            if self._frame_timer.isActive():
-                self._frame_timer.stop()
-            self._frame_timer.start()
+        if not self.frames_enabled:
+            return
+        if getattr(self, '_frames_transition_in_progress', False):
+            # suppress scheduling while a transition (enable/disable frames) is in progress
+            return
+        # mark frames dirty so the timer callback will rebuild them
+        self._frames_dirty = True
+        if self._frame_timer.isActive():
+            self._frame_timer.stop()
+        self._frame_timer.start()
 
     def refresh_connection_colors(self):
         """Update colors for all existing connections based on current node network_id and palette."""
@@ -3428,6 +3385,27 @@ class FocusTreeCanvas(QGraphicsScene):
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         return None
 
+    def sync_focus_connections(self, focus_id: str) -> None:
+        """Synchronize incoming prerequisite connection lines on the canvas for a focus."""
+        node = self.nodes.get(focus_id)
+        if node is None or getattr(node, 'focus', None) is None:
+            return
+        desired = [str(p).strip() for p in (getattr(node.focus, 'prerequisites', []) or []) if str(p).strip()]
+        existing_by_from = {}
+        for conn in list(getattr(node, 'connections_in', []) or []):
+            sn = getattr(conn, 'start_node', None)
+            sf = getattr(sn, 'focus', None) if sn is not None else None
+            fid = str(getattr(sf, 'id', '') or '').strip()
+            if fid not in desired:
+                self.remove_connection(conn)
+            else:
+                existing_by_from[fid] = conn
+        for pid in desired:
+            if pid not in existing_by_from and pid in self.nodes:
+                self.create_connection(pid, focus_id)
+        self.recompute_lineages()
+        self.refresh_connection_colors()
+
     def remove_connection(self, connection):
         """Remove a connection and clean up references"""
         if connection in self.connections:
@@ -3593,96 +3571,92 @@ class FocusTreeCanvas(QGraphicsScene):
 
     def recompute_leaf_lineages(self) -> None:
         """Compute deepest descendant leaf for each node and assign a unique color per leaf."""
-        with silent_operation("recompute_leaf_lineages"):
-            children: Dict[str, List[str]] = {}
-            for conn in self.connections:
-                with silent_operation("collect_children"):
-                    p = conn.start_node.focus.id
-                    c = conn.end_node.focus.id
-                    children.setdefault(p, []).append(c)
-            nodes = list(self.nodes.keys())
-            from functools import lru_cache
+        children: Dict[str, List[str]] = {}
+        for conn in self.connections:
+            p = conn.start_node.focus.id
+            c = conn.end_node.focus.id
+            children.setdefault(p, []).append(c)
+        nodes = list(self.nodes.keys())
+        from functools import lru_cache
 
-            @lru_cache(maxsize=None)
-            def best_leaf(nid: str):
-                ch = children.get(nid, [])
-                if not ch:
-                    return (0, nid)
-                best = (-1, nid)
-                for kid in ch:
-                    d, leaf = best_leaf(kid)
-                    if d + 1 > best[0]:
-                        best = (d + 1, leaf)
-                return best
+        @lru_cache(maxsize=None)
+        def best_leaf(nid: str):
+            ch = children.get(nid, [])
+            if not ch:
+                return (0, nid)
+            best = (-1, nid)
+            for kid in ch:
+                d, leaf = best_leaf(kid)
+                if d + 1 > best[0]:
+                    best = (d + 1, leaf)
+            return best
 
-            leaf_of: Dict[str, str] = {}
-            for nid in nodes:
-                leaf_of[nid] = best_leaf(nid)[1]
-            self._leaf_of_node = leaf_of
-            leaf_ids = sorted(set(leaf_of.values()))
-            n = max(1, len(leaf_ids))
-            self._leaf_colors.clear()
-            for idx, lid in enumerate(leaf_ids):
-                hue = (idx * (360.0 / n)) % 360.0
-                col = QColor()
-                col.setHslF(hue/360.0, 0.8, 0.45, 1.0)
-                self._leaf_colors[lid] = col
-            self._leaf_dirty = False
+        leaf_of: Dict[str, str] = {}
+        for nid in nodes:
+            leaf_of[nid] = best_leaf(nid)[1]
+        self._leaf_of_node = leaf_of
+        leaf_ids = sorted(set(leaf_of.values()))
+        n = max(1, len(leaf_ids))
+        self._leaf_colors.clear()
+        for idx, lid in enumerate(leaf_ids):
+            hue = (idx * (360.0 / n)) % 360.0
+            col = QColor()
+            col.setHslF(hue/360.0, 0.8, 0.45, 1.0)
+            self._leaf_colors[lid] = col
+        self._leaf_dirty = False
 
     def compact_connected_layout(self) -> None:
         """Pack connected focuses closer horizontally within each row while preserving y levels."""
-        with silent_operation("compact_connected_layout"):
-            # Respect global auto-layout toggle
-            if not getattr(self, 'auto_layout_enabled', False):
-                return
-            # Avoid changing layout while user is creating connections
-            if getattr(self, 'connection_mode', False):
-                return
-            if not self.nodes:
-                return
-            children: Dict[str, List[str]] = {}
-            parents: Dict[str, List[str]] = {}
-            for conn in self.connections:
-                with silent_operation("collect_connection_data"):
-                    p = conn.start_node.focus.id
-                    c = conn.end_node.focus.id
-                    children.setdefault(p, []).append(c)
-                    parents.setdefault(c, []).append(p)
-            levels: Dict[int, List[FocusNode]] = {}
-            for node in self.nodes.values():
-                if (node.focus.id in children) or (node.focus.id in parents):
-                    levels.setdefault(int(node.focus.y), []).append(node)
-            if not levels:
-                return
-            for _ in range(2):
-                for y in sorted(levels.keys()):
-                    row = levels[y]
-                    if not row:
-                        continue
-                    items = []
-                    for n in row:
-                        ps = parents.get(n.focus.id, [])
-                        if ps:
-                            avg = sum(self.nodes[p].focus.x for p in ps if p in self.nodes) / max(1, len(ps))
-                        else:
-                            avg = n.focus.x
-                        items.append((avg, n))
-                    items.sort(key=lambda t: t[0])
-                    if items:
-                        avgx = sum(t[0] for t in items) / len(items)
+        # Respect global auto-layout toggle
+        if not getattr(self, 'auto_layout_enabled', False):
+            return
+        # Avoid changing layout while user is creating connections
+        if getattr(self, 'connection_mode', False):
+            return
+        if not self.nodes:
+            return
+        children: Dict[str, List[str]] = {}
+        parents: Dict[str, List[str]] = {}
+        for conn in self.connections:
+            p = conn.start_node.focus.id
+            c = conn.end_node.focus.id
+            children.setdefault(p, []).append(c)
+            parents.setdefault(c, []).append(p)
+        levels: Dict[int, List[FocusNode]] = {}
+        for node in self.nodes.values():
+            if (node.focus.id in children) or (node.focus.id in parents):
+                levels.setdefault(int(node.focus.y), []).append(node)
+        if not levels:
+            return
+        for _ in range(2):
+            for y in sorted(levels.keys()):
+                row = levels[y]
+                if not row:
+                    continue
+                items = []
+                for n in row:
+                    ps = parents.get(n.focus.id, [])
+                    if ps:
+                        avg = sum(self.nodes[p].focus.x for p in ps if p in self.nodes) / max(1, len(ps))
                     else:
-                        avgx = 0.0
-                    start_x = int(round(avgx - (len(items)-1)/2.0))
-                    cur_x = start_x
-                    for _, n in items:
-                        if n.focus.x != cur_x:
-                            n.focus.x = cur_x
-                            n.setPos(n.focus.x * GRID_UNIT, n.focus.y * GRID_UNIT)
-                        cur_x += 1
-            for node in self.nodes.values():
-                node.update_connections()
-            self._frames_dirty = True
-            self.schedule_frame_update()
+                        avg = n.focus.x
+                    items.append((avg, n))
+                items.sort(key=lambda t: t[0])
+                if items:
+                    avgx = sum(t[0] for t in items) / len(items)
+                else:
+                    avgx = 0.0
+                start_x = int(round(avgx - (len(items)-1)/2.0))
+                cur_x = start_x
+                for _, n in items:
+                    if n.focus.x != cur_x:
+                        n.focus.x = cur_x
+                        n.setPos(n.focus.x * GRID_UNIT, n.focus.y * GRID_UNIT)
+                    cur_x += 1
+        for node in self.nodes.values():
+            node.update_connections()
+        self._frames_dirty = True
+        self.schedule_frame_update()
 
     def mousePressEvent(self, event):
         # Canonical canvas-only linking: when connection_mode is True, allow left-click
@@ -4005,34 +3979,64 @@ class FocusTreeCanvas(QGraphicsScene):
     # --------------
     def _collect_lineage_ids(self, focus_id: str) -> set[str]:
         """Collect ancestors and descendants of the given focus id via prerequisites graph."""
-        ids = set([focus_id])
-        # maps
+        ids = {focus_id}
+        start_node = self.nodes.get(focus_id)
+        if start_node is not None and (hasattr(start_node, 'connections_in') or hasattr(start_node, 'connections_out')):
+            # Fast O(lineage) BFS using existing node connection lists
+            up = [start_node]
+            while up:
+                cur = up.pop()
+                for conn in getattr(cur, 'connections_in', ()):
+                    sn = getattr(conn, 'start_node', None)
+                    sf = getattr(sn, 'focus', None)
+                    sid = getattr(sf, 'id', None)
+                    if sid and sid not in ids:
+                        ids.add(sid)
+                        up.append(sn)
+            down = [start_node]
+            while down:
+                cur = down.pop()
+                for conn in getattr(cur, 'connections_out', ()):
+                    en = getattr(conn, 'end_node', None)
+                    ef = getattr(en, 'focus', None)
+                    eid = getattr(ef, 'id', None)
+                    if eid and eid not in ids:
+                        ids.add(eid)
+                        down.append(en)
+            return ids
+        # Fallback: build adjacency from self.nodes
         parents_map: Dict[str, List[str]] = {}
         children_map: Dict[str, List[str]] = {}
         for nid, node in self.nodes.items():
             for p in node.focus.prerequisites:
                 parents_map.setdefault(nid, []).append(p)
                 children_map.setdefault(p, []).append(nid)
-        # BFS up (ancestors)
         up = [focus_id]
         while up:
             cur = up.pop()
-            for par in parents_map.get(cur, []):
+            for par in parents_map.get(cur, ()):
                 if par not in ids:
                     ids.add(par)
                     up.append(par)
-        # BFS down (descendants)
         down = [focus_id]
         while down:
             cur = down.pop()
-            for ch in children_map.get(cur, []):
+            for ch in children_map.get(cur, ()):
                 if ch not in ids:
                     ids.add(ch)
                     down.append(ch)
         return ids
 
+    @staticmethod
+    def _set_opacity_if_changed(item, target: float) -> None:
+        if item.opacity() != target:
+            item.setOpacity(target)
+
     def highlight_lineage(self, focus_id: str) -> None:
         """Dim non-lineage nodes and connections, highlight the lineage."""
+        views = self.views() if hasattr(self, 'views') else []
+        for v in views:
+            v.setUpdatesEnabled(False)
         try:
             ids = self._collect_lineage_ids(focus_id)
             self._lineage_active = True
@@ -4112,20 +4116,20 @@ class FocusTreeCanvas(QGraphicsScene):
             try:
                 for fid, node in self.nodes.items():
                     key = ("F", fid)
-                    node.setOpacity(1.0 if key in visited else 0.2)
+                    self._set_opacity_if_changed(node, 1.0 if key in visited else 0.2)
             except Exception as e:
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             try:
                 for eid, enode in getattr(self, 'event_nodes', {}).items():
                     key = ("E", eid)
-                    enode.setOpacity(1.0 if key in visited else 0.2)
+                    self._set_opacity_if_changed(enode, 1.0 if key in visited else 0.2)
             except Exception as e:
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             try:
                 for note in list(getattr(self, '_notes_items', []) or []):
                     key = ("N", getattr(note, 'note_id', None))
                     try:
-                        note.setOpacity(1.0 if key in visited else 0.2)
+                        self._set_opacity_if_changed(note, 1.0 if key in visited else 0.2)
                     except Exception as e:
                         handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             except Exception as e:
@@ -4138,7 +4142,7 @@ class FocusTreeCanvas(QGraphicsScene):
                         sid = conn.start_node.focus.id
                         eid = conn.end_node.focus.id
                         on_path = (("F", sid) in visited) and (("F", eid) in visited)
-                        conn.setOpacity(1.0 if on_path else 0.15)
+                        self._set_opacity_if_changed(conn, 1.0 if on_path else 0.15)
                     except Exception as e:
                         handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             except Exception as e:
@@ -4204,20 +4208,28 @@ class FocusTreeCanvas(QGraphicsScene):
             # frames dim
             for fr in self.frames:
                 try:
-                    fr.setOpacity(0.25)
+                    self._set_opacity_if_changed(fr, 0.25)
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        finally:
+            for v in views:
+                v.setUpdatesEnabled(True)
 
     def clear_highlight(self) -> None:
         """Restore full opacity to all items."""
+        if not getattr(self, '_lineage_active', False):
+            return
+        views = self.views() if hasattr(self, 'views') else []
+        for v in views:
+            v.setUpdatesEnabled(False)
         try:
             self._lineage_active = False
             self._lineage_ids.clear()
-            for node in list(self.nodes.values()):
+            for node in self.nodes.values():
                 try:
-                    node.setOpacity(1.0)
+                    self._set_opacity_if_changed(node, 1.0)
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             for enode in list(getattr(self, 'event_nodes', {}).values()):
@@ -4230,9 +4242,9 @@ class FocusTreeCanvas(QGraphicsScene):
                     note.setOpacity(1.0)
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-            for conn in list(self.connections):
+            for conn in self.connections:
                 try:
-                    conn.setOpacity(1.0)
+                    self._set_opacity_if_changed(conn, 1.0)
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             for ef in list(getattr(self, '_event_focus_links', [])):
@@ -4262,6 +4274,9 @@ class FocusTreeCanvas(QGraphicsScene):
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        finally:
+            for v in views:
+                v.setUpdatesEnabled(True)
 
     def recompute_lineages(self) -> None:
         """Compute lineage groups based on primary-parent relation (parent at y-1)."""
@@ -4353,7 +4368,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         self.events: List[Event] = []
         # Application version for internal tracking
         # Read from version.txt to avoid hardcoding and admin permission issues
-        self.app_version = self._load_version_from_file() or "1.0.9"
+        self.app_version = self._load_version_from_file() or "1.0.12"
         # path to the currently opened project file (if any)
         self.current_project_path: Optional[str] = None
         self.tree_id = "custom_focus_tree"
@@ -4386,6 +4401,24 @@ class HOI4FocusTreeGenerator(QMainWindow):
         self.theme_path: Optional[str] = None
         # Settings and database paths: defer to ensure_app_dirs so we can place them
         # under the platform-appropriate app base dir (AppData/XDG) by default.
+        self.prefer_app_settings = False
+        self.muted = False
+        self.show_tutorial_on_startup = True
+        self._project_dirty = False
+        try:
+            import weakref as _wr
+            global _ACTIVE_EDITOR_REF
+            _ACTIVE_EDITOR_REF = _wr.ref(self)
+        except Exception:
+            pass
+        self.autosave_enabled = False
+        self.autosave_interval_min = 5
+        self.autosave_overwrite = True
+        self.autosave_rotate = False
+        self.autosave_rotate_count = 6
+        self._autosave_timer = None
+        self._autosave_in_progress = False
+        self._last_autosave_path = None
         self.settings_path = None
         self.database_path = None
         # detect/create app base dir and required subfolders before UI
@@ -4436,6 +4469,91 @@ class HOI4FocusTreeGenerator(QMainWindow):
                         handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        try:
+            if bool(getattr(self, 'show_tutorial_on_startup', True)) and not os.environ.get('PYTEST_CURRENT_TEST') and os.environ.get('QT_QPA_PLATFORM') != 'offscreen':
+                QTimer.singleShot(300, lambda: self.show_starter_tutorial(force=False))
+        except Exception:
+            pass
+
+    def show_starter_tutorial(self, force: bool = False) -> None:
+        """Display a non-modal, interactive Starter Tutorial coach with live mission detection."""
+        if not force and not bool(getattr(self, 'show_tutorial_on_startup', True)):
+            return
+        try:
+            from _tutorial import InteractiveTutorialCoach
+            existing = getattr(self, '_tutorial_coach', None)
+            if existing is not None:
+                try:
+                    existing.close()
+                    existing.deleteLater()
+                except Exception:
+                    pass
+            self._tutorial_coach = InteractiveTutorialCoach(self)
+            return
+        except Exception as e:
+            logger.debug("[tutorial] falling back to static dialog: %s", e)
+        pages = [
+            ("1. Project & Workspace Basics",
+             "<h3>Welcome to HOI4 Focus Tree Generator</h3>"
+             "<p><b>Top Bar:</b> Use <b>File</b> to create, load, or save projects (<code>Ctrl+S</code>), and <b>Settings</b> on the far right to configure Autosave, Theme, and Appearance.</p>"
+             "<p><b>Tree ID &amp; Country Tag:</b> Set your focus tree ID and 3-letter Country Tag in the toolbar before exporting to HOI4.</p>"),
+            ("2. Creating &amp; Editing Focuses",
+             "<h3>Building Your Tree</h3>"
+             "<p><b>Add Focuses:</b> Right-click the canvas or press <code>Ctrl+Shift+F</code> (or <code>Ctrl+N</code> for the node palette).</p>"
+             "<p><b>Edit Focuses:</b> Double-click a focus or select it and press <code>Enter</code>. Use the <b>Pick…</b> buttons on the Advanced tab to select Prerequisites and Mutually Exclusive focuses without typing IDs.</p>"),
+            ("3. Connecting &amp; Organizing",
+             "<h3>Connections &amp; Safety</h3>"
+             "<p><b>Connect Focuses:</b> Toggle Connection Mode from the Tools menu or toolbar, then click parent → child focuses. You can also choose normal, <b>OR</b>, or <b>AND</b> prerequisite styles.</p>"
+             "<p><b>Deleting:</b> Both <code>Delete</code> and <code>Backspace</code> prompt for confirmation and support <code>Ctrl+Z</code> undo.</p>"),
+            ("4. Notes, Library &amp; Generator",
+             "<h3>Notes &amp; Random Generator</h3>"
+             "<p><b>Notes:</b> Click inside a note to edit its title or body. Hold <code>Alt</code> and drag anywhere on a note (or drag its border) to reposition it.</p>"
+             "<p><b>Random Generator (<code>Ctrl+G</code>):</b> Generate full focus trees with optional randomized base-game effects and state modifiers under the Advanced tab.</p>"),
+            ("5. Navigation &amp; Exporting",
+             "<h3>Navigation &amp; HOI4 Export</h3>"
+             "<p><b>Pan &amp; Zoom:</b> Middle-mouse drag to pan, mouse wheel to zoom smoothly.</p>"
+             "<p><b>Export:</b> Use <b>File → Open Export Panel</b> (<code>Ctrl+Shift+E</code>) to export your <code>.txt</code> focus tree and localisation <code>.yml</code> files.</p>"
+             "<p>You can reopen this guide anytime from <b>Help → Starter Tutorial…</b>.</p>"),
+        ]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Starter Tutorial")
+        dlg.resize(560, 360)
+        lay = QVBoxLayout(dlg)
+        step_lbl = QLabel()
+        step_lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
+        body = QLabel()
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(step_lbl)
+        lay.addWidget(body, 1)
+        startup_cb = QCheckBox("Show this tutorial on startup")
+        startup_cb.setChecked(bool(getattr(self, 'show_tutorial_on_startup', True)))
+        def _on_startup_cb(chk):
+            self.show_tutorial_on_startup = bool(chk)
+            if hasattr(self, 'save_settings'):
+                self.save_settings()
+        startup_cb.toggled.connect(_on_startup_cb)
+        nav = QHBoxLayout()
+        nav.addWidget(startup_cb)
+        nav.addStretch(1)
+        prev_btn = QPushButton("Back")
+        next_btn = QPushButton("Next")
+        close_btn = QPushButton("Close")
+        nav.addWidget(prev_btn); nav.addWidget(next_btn); nav.addWidget(close_btn)
+        lay.addLayout(nav)
+        idx = [0]
+        def _render():
+            t, html = pages[idx[0]]
+            step_lbl.setText(f"{t}  ({idx[0]+1}/{len(pages)})")
+            body.setText(html)
+            prev_btn.setEnabled(idx[0] > 0)
+            next_btn.setEnabled(idx[0] < len(pages) - 1)
+        prev_btn.clicked.connect(lambda: (idx.__setitem__(0, max(0, idx[0]-1)), _render()))
+        next_btn.clicked.connect(lambda: (idx.__setitem__(0, min(len(pages)-1, idx[0]+1)), _render()))
+        close_btn.clicked.connect(dlg.accept)
+        _render()
+        dlg.exec()
 
     def _load_version_from_file(self) -> Optional[str]:
         """Load application version from version.txt file in the workspace root.
@@ -4444,7 +4562,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         Falls back to None if file cannot be read.
 
         Returns:
-            Version string (e.g., "1.0.9") or None if file cannot be read
+            Version string (e.g., "1.0.12") or None if file cannot be read
         """
         try:
             # Try multiple potential locations for version.txt
@@ -4508,12 +4626,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             except Exception as e:
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
-        # Load settings early to restore previous state (including current project)
-        try:
-            self.load_settings()
-            self.load_database()
-        except Exception as e:
-            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+
 
     def _prefix_focus_id(self, fid: str) -> str:
         """Return a focus id prefixed with the current country tag if not already prefixed.
@@ -4671,7 +4784,14 @@ class HOI4FocusTreeGenerator(QMainWindow):
         add('file.new_node_palette', 'New Node…', self.open_node_palette, 'Ctrl+N')
         # Focus CRUD
         add('focus.add', 'Add Focus', self.add_focus, 'Ctrl+Shift+F')
-        add('focus.edit', 'Edit First Selected Focus', lambda: self.edit_focus(self._first_selected_focus()), 'Enter')
+        def _edit_focus_shortcut():
+            sc = getattr(self, 'canvas', None)
+            fi = sc.focusItem() if sc is not None else None
+            if fi is not None and isinstance(fi, QGraphicsTextItem):
+                if bool(fi.textInteractionFlags() & Qt.TextInteractionFlag.TextEditorInteraction):
+                    return
+            self.edit_focus(self._first_selected_focus())
+        add('focus.edit', 'Edit First Selected Focus', _edit_focus_shortcut, 'Enter')
         # Do not assign a default 'Delete' shortcut to avoid ambiguous shortcut warnings.
         add('focus.delete', 'Delete Selected Focuses', self.delete_selected_focuses, None)
         add('focus.duplicate', 'Duplicate First Selected Focus', lambda: self._first_selected_focus() and self.duplicate_focus(self._first_selected_focus()), 'Ctrl+D')
@@ -4776,6 +4896,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
 
     def new_project(self):
         """Create a new project file in the projects home folder and load it."""
+        self._project_dirty = False
         try:
             # Use the same folder resolution as Projects dialog and Save Project
             start = getattr(self, 'projects_home_path', None)
@@ -4789,27 +4910,77 @@ class HOI4FocusTreeGenerator(QMainWindow):
             if not ok or not name.strip():
                 return
             fn = os.path.join(start, f"{name.strip()}.json")
-            base = {'version': getattr(self, 'app_version', '1.0.9'), 'tree_id': name.strip(), 'country_tag': 'TAG', 'focuses': [], 'library': {}}
+            document = ProjectDocument()
+            document.focus_tree['tree_id'] = name.strip()
+            document.focus_tree['country_tag'] = 'TAG'
             os.makedirs(os.path.dirname(fn), exist_ok=True)
-            with open(fn, 'w', encoding='utf-8') as f:
-                json.dump(base, f, indent=2)
+            # A brand-new file has nothing worth backing up.
+            save_document(fn, document,
+                          app_version=getattr(self, 'app_version', '') or '',
+                          backups=False)
             # Load the new project
             self.load_project_from_path(fn)
         except Exception as e:
             show_error(self, "New Project", "Failed to create project.", exc=e)
 
-    def load_project_from_path(self, path: str):
-        """Load a project file by path and set current_project_path on success."""
+    def _offer_project_recovery(self, path: str, error: ProjectDocumentError):
+        """Ask the user whether to open a recovered copy of an unloadable file.
+
+        Returns ``(document, path_it_came_from)`` or None if the user declined
+        or nothing loadable exists. Nothing in the live project is touched
+        either way.
+        """
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                project = json.load(f)
-            # basic validation to avoid loading arbitrary JSON
-            if not isinstance(project, dict) or not isinstance(project.get('focuses', None), list):
-                raise ValueError("Invalid project file: missing 'focuses' list")
-            self.load_project_from_dict(project)
+            candidates = find_recovery_candidates(path, self._autosave_dir_for(path))
+        except Exception as exc:
+            logger.warning('Recovery scan failed for %s: %s', path, exc)
+            candidates = []
+        # Never offer the file we just failed on as its own recovery.
+        candidates = [c for c in candidates if os.path.abspath(c.path) != os.path.abspath(path)]
+        try:
+            dialog = ProjectRecoveryDialog(self, path, error, candidates)
+        except Exception as exc:
+            logger.warning('Could not build recovery dialog: %s', exc)
+            show_error(self, "Error", "Failed to load project.", exc=error)
+            return None
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.selected is None:
+            return None
+        chosen = dialog.selected
+        # Recovered content opens under the original project path so the next
+        # save writes back where the user expects, not into the autosave dir.
+        return chosen.document, path
+
+    def _autosave_dir_for(self, project_path: str) -> str:
+        """The autosave folder the app uses for a given project file."""
+        return os.path.join(os.path.dirname(project_path) or '.', 'autosaves')
+
+    def load_project_from_path(self, path: str):
+        """Load a project file by path and set current_project_path on success.
+
+        The document is parsed, migrated and validated in full before any of
+        it is applied, so a corrupt or half-written file leaves the current
+        canvas exactly as it was. If the file will not load, offer whatever
+        autosave or backup does load instead.
+        """
+        try:
+            try:
+                document = load_document(path)
+            except ProjectDocumentError as doc_exc:
+                recovered = self._offer_project_recovery(path, doc_exc)
+                if recovered is None:
+                    return
+                document, path = recovered
+            self.load_project_from_dict(document.to_legacy())
+            self._project_metadata = dict(document.metadata)
             self.current_project_path = path
             self.setWindowTitle(f"HOI4 Focus GUI - {os.path.basename(path)}")
-            QMessageBox.information(self, "Loaded", f"Project loaded from {obfuscate_path(path)}")
+            try:
+                self._project_dirty = False
+                if getattr(self, 'undo_stack', None) is not None:
+                    self.undo_stack.setClean()
+            except Exception:
+                pass
+            self.statusBar().showMessage(f"Loaded {obfuscate_path(path)}", 4000)
         except Exception as e:
             show_error(self, "Error", "Failed to load project.", exc=e)
         # Only load settings/database if this is a manual load (not during startup restoration)
@@ -4979,7 +5150,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
-        # Mute action (app-level) — visible in top toolbar
+        # Mute action (app-level) - visible in top toolbar
         mute_action = QAction("Mute App", self)
         # keep a reference so load_settings can update the toolbar state
         try:
@@ -4993,14 +5164,49 @@ class HOI4FocusTreeGenerator(QMainWindow):
             mute_action.setChecked(bool(getattr(self, 'muted', False)))
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        def _make_speaker_icon(muted: bool) -> QIcon:
+            pm = QPixmap(16, 16)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            col = QColor("#9ea3aa") if muted else QColor("#c8cdd3")
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(col))
+            # Speaker body + cone
+            p.drawRect(2, 6, 3, 4)
+            poly = QPolygonF([QPointF(5, 6), QPointF(9, 3), QPointF(9, 13), QPointF(5, 10)])
+            p.drawPolygon(poly)
+            if muted:
+                p.setPen(QPen(QColor("#e06c60"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(11, 5), QPointF(14, 11))
+                p.drawLine(QPointF(14, 5), QPointF(11, 11))
+            else:
+                p.setPen(QPen(col, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawArc(9, 5, 4, 6, -45 * 16, 90 * 16)
+                p.drawArc(10, 3, 5, 10, -45 * 16, 90 * 16)
+            p.end()
+            return QIcon(pm)
+
+        def _apply_mute_visual(is_muted: bool):
+            mute_action.setIcon(_make_speaker_icon(is_muted))
+            mute_action.setText("Muted" if is_muted else "Mute App")
+            mute_action.setToolTip("App sounds muted — click to unmute" if is_muted else "Mute notification sounds")
+            btn = toolbar.widgetForAction(mute_action)
+            if btn is not None:
+                btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                if is_muted:
+                    btn.setStyleSheet(
+                        "QToolButton { background-color: #323337; color: #dcdcdc; "
+                        "border: 1px solid #505258; border-radius: 3px; padding: 1px 6px; }"
+                    )
+                else:
+                    btn.setStyleSheet("")
+        self._apply_mute_visual = _apply_mute_visual
         def _toggle_mute(checked):
             try:
                 self.muted = bool(checked)
-                # Also silence logger handlers if muting console logging
-                if getattr(self, 'logging_enabled', False) and not getattr(self, 'muted', False):
-                    # keep logging as-is
-                    pass
-                # Persist immediate app preference if desired
+                _apply_mute_visual(self.muted)
                 try:
                     if hasattr(self, 'save_settings'):
                         self.save_settings()
@@ -5010,6 +5216,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         mute_action.toggled.connect(_toggle_mute)
         toolbar.addAction(mute_action)
+        _apply_mute_visual(bool(getattr(self, 'muted', False)))
 
         # Persistent Save indicator (dim and bright icons for clear feedback)
         try:
@@ -5516,11 +5723,38 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
+                # Parse in recovering mode so a single malformed block does not
+                # cost the user the whole file, then report every recovery with
+                # its line, column and source context instead of "parse failed".
+                display_name = os.path.basename(filename)
                 try:
-                    parsed = convert_txt_to_project_dict(txt)
+                    parsed = convert_txt_to_project_dict(txt, filename=display_name)
+                except ParadoxSyntaxError as e:
+                    _show_parse_diagnostics(
+                        self,
+                        [d.to_dict() for d in e.diagnostics],
+                        display_name,
+                        allow_continue=False,
+                    )
+                    return
                 except Exception as e:
                     show_error(self, "Parse Error", f"Failed to parse focus .txt file: {obfuscate_path(filename)}", exc=e)
                     return
+
+                diagnostics = parsed.get('diagnostics') or []
+                if diagnostics:
+                    errors = [d for d in diagnostics if d.get('severity') == 'error']
+                    if errors and not _show_parse_diagnostics(
+                        self, diagnostics, display_name, allow_continue=True
+                    ):
+                        return
+                    for record in diagnostics:
+                        logger.warning(
+                            "import diagnostic %s:%s:%s [%s] %s",
+                            record.get('filename'), record.get('line'),
+                            record.get('column'), record.get('code'),
+                            record.get('message'),
+                        )
 
                 # Build a project dict compatible with load_project_from_dict
                 project: dict = {
@@ -6016,6 +6250,15 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        # Diagnostics dock + the action that reveals it. Validation is always
+        # available on demand here, and runs implicitly before every export.
+        self._setup_diagnostics_panel()
+        diagnostics_action = QAction("Validate Focus Tree", self)
+        diagnostics_action.setToolTip("Check the focus tree for problems and list them in the Diagnostics panel")
+        diagnostics_action.triggered.connect(self.show_diagnostics_panel)
+        tools_menu.addAction(diagnostics_action)
+        self._diagnostics_action = diagnostics_action
+
         # Compact connected layout
         compact_action = QAction("Compact Connected Layout", self)
         def _do_compact():
@@ -6330,7 +6573,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     except Exception:
                         undo_action.setEnabled(False); redo_action.setEnabled(False)
             else:
-                # No undo stack available — disable the actions
+                # No undo stack available - disable the actions
                 undo_action.setEnabled(False); redo_action.setEnabled(False)
             edit_menu.addAction(undo_action)
             edit_menu.addAction(redo_action)
@@ -6371,26 +6614,16 @@ class HOI4FocusTreeGenerator(QMainWindow):
         lib_menu.addAction(icon_lib_action)
 
         help_menu = QMenu("Help", self)
+        tutorial_action = QAction("Starter Tutorial…", self)
+        tutorial_action.triggered.connect(lambda: self.show_starter_tutorial(force=True))
+        help_menu.addAction(tutorial_action)
+        help_menu.addSeparator()
         check_update_action = QAction("Check for Updates...", self)
         check_update_action.triggered.connect(self.check_for_updates)
-        # The built-in updater currently downloads Windows .exe assets only.
-        # Keep the action visible on Linux but disable it with a clear message.
         if not sys.platform.startswith('win'):
             check_update_action.setEnabled(False)
             check_update_action.setToolTip("Self-update is currently Windows-only. Use your package manager/AppImage release on Linux.")
         help_menu.addAction(check_update_action)
-        try:
-            self.menuBar().addMenu(help_menu)
-        except Exception as e:
-            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-
-        # Add menu actions to the toolbar (condensed UI)
-        toolbar.addAction(file_menu.menuAction())
-        toolbar.addAction(edit_menu.menuAction())
-        toolbar.addAction(tools_menu.menuAction())
-        toolbar.addAction(view_menu.menuAction())
-        toolbar.addAction(lib_menu.menuAction())
-        # Dedicated Settings button (toolbar) — opens full settings panel
         settings_btn = QAction("Settings", self)
         settings_btn.setToolTip("Open application settings")
         def _open_settings_btn():
@@ -6404,19 +6637,46 @@ class HOI4FocusTreeGenerator(QMainWindow):
             except Exception as e:
                 show_error(self, "Settings", "Failed to open settings.", exc=e)
         settings_btn.triggered.connect(_open_settings_btn)
-        toolbar.addAction(settings_btn)
-        # Tree settings
+        try:
+            mb = self.menuBar()
+            mb.addMenu(file_menu)
+            mb.addMenu(edit_menu)
+            mb.addMenu(tools_menu)
+            mb.addMenu(view_menu)
+            mb.addMenu(lib_menu)
+            mb.addMenu(help_menu)
+            mb.addAction(settings_btn)
+        except Exception as e:
+            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+        # Tree settings (compact, auto-expanding Tree ID field)
         toolbar.addWidget(QLabel("Tree ID:"))
         self.tree_id_edit = QLineEdit(self.tree_id)
-        self.tree_id_edit.setMaximumWidth(150)
-        self.tree_id_edit.textChanged.connect(lambda t: setattr(self, 'tree_id', t))
+        self.tree_id_edit.setMinimumWidth(64)
+        self.tree_id_edit.setMaximumWidth(240)
+        def _resize_tree_id(txt: str):
+            setattr(self, 'tree_id', txt)
+            try:
+                w = self.tree_id_edit.fontMetrics().horizontalAdvance(txt or 'TAG') + 20
+                self.tree_id_edit.setFixedWidth(max(64, min(240, w)))
+            except Exception:
+                pass
+        self.tree_id_edit.textChanged.connect(_resize_tree_id)
+        self.tree_id_edit.textEdited.connect(lambda _t: setattr(self, '_project_dirty', True))
+        _resize_tree_id(self.tree_id)
         toolbar.addWidget(self.tree_id_edit)
+        _sp1 = QWidget()
+        _sp1.setFixedWidth(14)
+        toolbar.addWidget(_sp1)
 
         toolbar.addWidget(QLabel("Country:"))
         self.country_edit = QLineEdit(self.country_tag)
         self.country_edit.setMaximumWidth(60)
         self.country_edit.textChanged.connect(lambda t: setattr(self, 'country_tag', t))
+        self.country_edit.textEdited.connect(lambda _t: setattr(self, '_project_dirty', True))
         toolbar.addWidget(self.country_edit)
+        _sp2 = QWidget()
+        _sp2.setFixedWidth(10)
+        toolbar.addWidget(_sp2)
 
         # Library dock (dockable panel)
         self.library_dock = QDockWidget("Focus Library", self)
@@ -6476,7 +6736,16 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     toggle.toggled.connect(_toggle_dock)
                     try:
                         toolbar.addAction(toggle)
+                        toggle.setVisible(bool(getattr(self, 'show_state_viewport_toolbar', False)))
                         self.toggle_state_viewport_action = toggle
+                        sv_tb_act = QAction("Show State Viewport on Toolbar", self)
+                        sv_tb_act.setCheckable(True)
+                        sv_tb_act.setChecked(bool(getattr(self, 'show_state_viewport_toolbar', False)))
+                        def _on_sv_tb(v: bool):
+                            self.show_state_viewport_toolbar = bool(v)
+                            toggle.setVisible(bool(v))
+                        sv_tb_act.toggled.connect(_on_sv_tb)
+                        view_menu.addAction(sv_tb_act)
                     except Exception:
                         # fallback: attach to main toolbar reference if available
                         try:
@@ -6917,7 +7186,9 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     # `app_settings.json` file which may override the canvas settings above.
                     try:
                         # Apply basic preference values to attributes and UI controls
+                        self.prefer_app_settings = bool(prefs.get('prefer_app_settings', getattr(self, 'prefer_app_settings', False)))
                         self.muted = bool(prefs.get('muted', getattr(self, 'muted', False)))
+                        self.show_tutorial_on_startup = bool(prefs.get('show_tutorial_on_startup', getattr(self, 'show_tutorial_on_startup', True)))
                         self.autosave_enabled = bool(prefs.get('autosave_enabled', getattr(self, 'autosave_enabled', False)))
                         try:
                             self.autosave_interval_min = int(prefs.get('autosave_interval_min', getattr(self, 'autosave_interval_min', 5)))
@@ -6942,6 +7213,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
                             if hasattr(self, 'mute_action') and self.mute_action is not None:
                                 try:
                                     self.mute_action.setChecked(bool(self.muted))
+                                    if hasattr(self, '_apply_mute_visual'):
+                                        self._apply_mute_visual(bool(self.muted))
                                 except Exception as e:
                                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
                         except Exception as e:
@@ -7052,6 +7325,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
                                         if hasattr(self, 'mute_action') and self.mute_action is not None:
                                             try:
                                                 self.mute_action.setChecked(bool(self.muted))
+                                                if hasattr(self, '_apply_mute_visual'):
+                                                    self._apply_mute_visual(bool(self.muted))
                                             except Exception as e:
                                                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
                                     except Exception as e:
@@ -7155,6 +7430,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
                                                     if hasattr(self, 'mute_action') and self.mute_action is not None:
                                                         try:
                                                             self.mute_action.setChecked(bool(self.muted))
+                                                            if hasattr(self, '_apply_mute_visual'):
+                                                                self._apply_mute_visual(bool(self.muted))
                                                         except Exception as e:
                                                             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
                                                 except Exception as e:
@@ -7439,7 +7716,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     np = os.path.abspath(str(p))
                     # treat paths inside the user's home or the current working dir as
                     # uninitialized defaults that should be moved into app_base_dir
-                    if np.startswith(home) or np.startswith(cwd):
+                    if np == home or np == cwd:
                         return True
                 except Exception:
                     return True
@@ -7515,6 +7792,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     self._preferences = {}
                 self._preferences['prefer_app_settings'] = bool(getattr(self, 'prefer_app_settings', False))
                 self._preferences['muted'] = bool(getattr(self, 'muted', False))
+                self._preferences['show_tutorial_on_startup'] = bool(getattr(self, 'show_tutorial_on_startup', True))
                 self._preferences['autosave_enabled'] = bool(getattr(self, 'autosave_enabled', False))
                 self._preferences['autosave_interval_min'] = max(1, int(getattr(self, 'autosave_interval_min', 5) or 5))
                 self._preferences['autosave_overwrite'] = bool(getattr(self, 'autosave_overwrite', True))
@@ -7531,7 +7809,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
             data = {
-                'app_version': getattr(self, 'app_version', '1.0.9'),
+                'app_version': getattr(self, 'app_version', '1.0.12'),
                 'canvas': self.canvas.to_settings(),
                 'keybindings': (self.keybinds.get_mapping() if getattr(self, 'keybinds', None) is not None else {}),
                 'paths': {
@@ -7572,8 +7850,12 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     ddir = os.path.dirname(pth)
                     if ddir:
                         os.makedirs(ddir, exist_ok=True)
-                    with open(pth, 'w', encoding='utf-8') as f:
+                    tmp_pth = f"{pth}.tmp.{os.getpid()}"
+                    with open(tmp_pth, 'w', encoding='utf-8') as f:
                         json.dump(data, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_pth, pth)
                     return True
                 except Exception as e:
                     handle_exception(
@@ -7606,7 +7888,9 @@ class HOI4FocusTreeGenerator(QMainWindow):
                         # restored even if the user later disables the toggle.
                         try:
                             last_path = os.path.join(base_dir, 'app_settings_last.json')
-                            last_payload = {'canvas': data.get('canvas', {}), 'preferences': {'prefer_app_settings': False}}
+                            last_prefs = dict(data.get('preferences', {}) or {})
+                            last_prefs['prefer_app_settings'] = False
+                            last_payload = {'canvas': data.get('canvas', {}), 'preferences': last_prefs}
                             with open(last_path, 'w', encoding='utf-8') as lf:
                                 json.dump(last_payload, lf, indent=2)
                         except Exception:
@@ -7636,7 +7920,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             except Exception:
                 return True
 
-        # If we reach here the write failed — show a dialog with Retry / Choose Folder / Cancel
+        # If we reach here the write failed - show a dialog with Retry / Choose Folder / Cancel
         try:
             while True:
                 resp = QMessageBox.question(self, 'Save Settings Failed',
@@ -7761,11 +8045,18 @@ class HOI4FocusTreeGenerator(QMainWindow):
             return
         self._autosave_in_progress = True
         try:
+            document = ProjectDocument.from_legacy(
+                payload, app_version=getattr(self, 'app_version', '') or '')
+            prior = getattr(self, '_project_metadata', None)
+            if isinstance(prior, dict) and prior.get('created_utc'):
+                document.metadata['created_utc'] = prior['created_utc']
+            app_version = getattr(self, 'app_version', '') or ''
             if bool(getattr(self, 'autosave_rotate', False)):
-                keep = int(getattr(self, 'autosave_rotate_count', 6) or 6)
-                write_rotating_autosave(base_path, payload, keep)
+                keep = int(getattr(self, 'autosave_rotate_count', DEFAULT_AUTOSAVE_KEEP)
+                           or DEFAULT_AUTOSAVE_KEEP)
+                save_rotating(base_path, document, app_version=app_version, keep=keep)
             else:
-                atomic_write_json(base_path, payload)
+                save_document(base_path, document, app_version=app_version, backups=False)
             try:
                 self._last_autosave_path = base_path
             except Exception as e:
@@ -8001,14 +8292,42 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 'library': self.library,
                 'folders': self.library_folders,
                 'icon_library': self.icon_library,
-                'version': getattr(self, 'app_version', '1.0.9')
+                'version': getattr(self, 'app_version', '1.0.12')
             }
-            with open(path, 'w', encoding='utf-8') as f:
+            ddir = os.path.dirname(path)
+            if ddir:
+                os.makedirs(ddir, exist_ok=True)
+            tmp_path = f"{path}.tmp.{os.getpid()}"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
         except Exception as e:
             logger.warning("Could not save library database: %s", e)
 
     def closeEvent(self, event):
+        try:
+            uw = getattr(self, 'undo_stack', None)
+            is_dirty = (not os.environ.get('PYTEST_CURRENT_TEST')) and (bool(getattr(self, '_project_dirty', False)) or (uw is not None and not uw.isClean()))
+            if is_dirty:
+                resp = QMessageBox.question(
+                    self,
+                    "Unsaved Changes",
+                    "You have unsaved changes. Save project before closing?",
+                    QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                    defaultButton=QMessageBox.StandardButton.Save,
+                )
+                if resp == QMessageBox.StandardButton.Cancel:
+                    event.ignore()
+                    return
+                if resp == QMessageBox.StandardButton.Save:
+                    self.save_project()
+                    if uw is not None and not uw.isClean():
+                        event.ignore()
+                        return
+        except Exception as e:
+            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
         try:
             self.save_settings()
             self.save_database()
@@ -8022,7 +8341,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
     def delete_selected_focuses(self):
         selected = [it for it in self.canvas.selectedItems() if isinstance(it, FocusNode)]
         if not selected:
-            QMessageBox.information(self, "Delete", "No focuses selected.")
+            self.statusBar().showMessage("No focuses selected.", 3000)
             return
             reply = QMessageBox.question(self, "Delete Selected", f"Delete {len(selected)} selected focus(es)? This removes connections too.",
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -8077,7 +8396,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         try:
             for node in list(events):
                 try:
-                    # bulk delete already confirmed — suppress per-event dialogs
+                    # bulk delete already confirmed - suppress per-event dialogs
                     self.delete_event_node(node, confirm=False)
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
@@ -8140,7 +8459,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         """Align selected focus nodes into a vertical line with consistent spacing."""
         nodes = [it for it in self.canvas.selectedItems() if isinstance(it, FocusNode)]
         if not nodes:
-            QMessageBox.information(self, "Arrange", "Select some focus nodes first.")
+            self.statusBar().showMessage("Select some focus nodes first.", 3000)
             return
         # Determine base x from median of current x positions
         xs = sorted([n.focus.x for n in nodes])
@@ -8282,17 +8601,18 @@ class HOI4FocusTreeGenerator(QMainWindow):
         macro = None
         if main_uw is not None:
             macro = MacroCommand(description=f"Append Generated {len(part)} focuses")
+        existing_ids = {ex.id for ex in self.focuses}
         for f in part:
-            # avoid id collision
-            if any(existing.id == f.id for existing in self.focuses):
-                # make unique
+            # avoid id collision in O(1)
+            if f.id in existing_ids:
                 base = f.id
                 i = 1
                 nid = f"{base}_{i}"
-                while any(ex.id == nid for ex in self.focuses):
+                while nid in existing_ids:
                     i += 1
                     nid = f"{base}_{i}"
                 f.id = nid
+            existing_ids.add(f.id)
             if macro is not None:
                 macro.addCommand(AddFocusCommand(self, f, description=f"Add generated focus {f.id}"))
             else:
@@ -8619,6 +8939,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
 
     def edit_focus(self, focus):
         """Edit focus properties with enhanced dialog"""
+        if focus is None:
+            return
         # snapshot before
         before = clone_focus_pure(focus)
         # Highlight lineage while editing
@@ -8626,7 +8948,16 @@ class HOI4FocusTreeGenerator(QMainWindow):
             self.canvas.highlight_lineage(focus.id)
         except Exception as e:
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-        dialog = FocusEditDialog(focus, self, library=self.library)
+        try:
+            dialog = FocusEditDialog(focus, self, library=self.library)
+        except Exception as e:
+            handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
+            try:
+                self.canvas.clear_highlight()
+            except Exception:
+                pass
+            show_error(self, "Edit Focus", "Failed to open Focus Properties dialog.", exc=e)
+            return
         # Expose the dialog so canvas.add_event_focus_link can refresh its reward_edit
         # when injecting a concise country_event snippet. Ensure we always clear the
         # reference after the dialog closes to avoid stale pointers.
@@ -8672,7 +9003,11 @@ class HOI4FocusTreeGenerator(QMainWindow):
                         f.prerequisites = [focus.id if p == old_id else p for p in f.prerequisites]
                         f.mutually_exclusive = [focus.id if m == old_id else m for m in f.mutually_exclusive]
                 try:
+                    self.canvas.sync_focus_connections(focus.id)
                     self.canvas.refresh_mutex_connectors()
+                    node = self.canvas.nodes.get(focus.id)
+                    if node is not None:
+                        node.update()
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
@@ -8684,6 +9019,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         before_id = event.id
         dlg = EventEditDialog(event, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._project_dirty = True
             try:
                 # if id changed, update canvas mapping
                 if before_id != event.id and hasattr(self.canvas, 'event_nodes'):
@@ -8710,6 +9046,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                                          defaultButton=QMessageBox.StandardButton.Yes)
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        self._project_dirty = True
         try:
             # remove from list
             self.events = [e for e in self.events if getattr(e, 'id', None) != eid]
@@ -8802,7 +9139,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             if created > 0:
                 self.statusBar().showMessage(f"Created {created} link(s).")
             else:
-                # no modal dialogs — just update status bar
+                # no modal dialogs - just update status bar
                 self.statusBar().showMessage("No valid links created from selection.")
         except Exception:
             # Swallow detailed modal error reporting to avoid popups; log to status bar
@@ -8815,7 +9152,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         """Copy selected focus nodes into an internal buffer (simple dict list)."""
         selected = [n for n in self.canvas.nodes.values() if n.isSelected()]
         if not selected:
-            QMessageBox.information(self, "Copy", "No focuses selected to copy.")
+            self.statusBar().showMessage("No focuses selected to copy.", 3000)
             return
         buf = []
         for node in selected:
@@ -8844,7 +9181,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         """Paste focuses from internal buffer with offset to avoid overlap."""
         buf = getattr(self, '_copy_buffer', None)
         if not buf:
-            QMessageBox.information(self, "Paste", "Copy buffer is empty.")
+            self.statusBar().showMessage("Copy buffer is empty.", 3000)
             return
         # Determine paste origin: use current mouse scene position if available, else offset by 1 grid unit
         view = getattr(self, 'view', None)
@@ -9040,7 +9377,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             multi_macro = MacroCommand(description=f"Multi-Add {count} focuses")
         for idx in range(count):
             nid = f"{base_id}{idx+1}"
-            # ensure uniqueness — check the prefixed candidate so numbering uses project tag
+            # ensure uniqueness - check the prefixed candidate so numbering uses project tag
             suffix = 1
             candidate = nid
             existing_ids = {f.id for f in self.focuses}
@@ -9085,7 +9422,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         items = [n for n in self.canvas.nodes.values() if n.isSelected()]
         items += [n for n in getattr(self.canvas, 'event_nodes', {}).values() if n.isSelected()]
         if not items:
-            QMessageBox.information(self, "Colorize", "No nodes selected.")
+            self.statusBar().showMessage("No nodes selected.", 3000)
             return
         color = QColorDialog.getColor(parent=self, title="Pick Node Color")
         if not color.isValid():
@@ -9133,7 +9470,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
             for n in items:
                 n.update()
-        QMessageBox.information(self, "Colorize", f"Applied color to {len(items)} node(s).")
+        self.statusBar().showMessage(f"Applied color to {len(items)} node(s).", 3000)
 
     def duplicate_focus(self, original_focus):
         """Create a duplicate of the given focus"""
@@ -9200,6 +9537,17 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     focus.prerequisites.remove(focus_id)
                 if focus_id in focus.mutually_exclusive:
                     focus.mutually_exclusive.remove(focus_id)
+                groups = getattr(focus, 'prerequisites_groups', None)
+                if isinstance(groups, list) and groups:
+                    cleaned_groups = []
+                    for g in groups:
+                        if isinstance(g, dict):
+                            items = [it for it in (g.get('items') or []) if it != focus_id]
+                            if items:
+                                cleaned_groups.append({**g, 'items': items})
+                    focus.prerequisites_groups = cleaned_groups
+                if getattr(focus, 'relative_position_id', None) == focus_id:
+                    focus.relative_position_id = None
             # Remove from canvas
             self.canvas.remove_node(node)
             self.statusBar().showMessage(f"Deleted focus: {focus_id}")
@@ -9278,6 +9626,129 @@ class HOI4FocusTreeGenerator(QMainWindow):
             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
 
     # -------------------------
+    # Validation & diagnostics
+    # -------------------------
+    # The rules themselves live in _validation.py and the list widget in
+    # _diagnostics_panel.py. What follows is only the glue: building a
+    # domain tree out of the editor's live state, and turning a selected
+    # diagnostic into a canvas selection.
+
+    def build_validation_tree(self) -> FocusTree:
+        """Snapshot the editor's current state as a domain FocusTree.
+
+        The validator works on domain data, not on canvas nodes, so this is
+        the one place that crosses from editor state into the domain model.
+        """
+        return FocusTree(
+            id=str(getattr(self, 'tree_id', '') or ''),
+            tree_name=str(getattr(self, 'tree_id', '') or ''),
+            focuses=list(getattr(self, 'focuses', []) or []),
+            country_tag=str(getattr(self, 'country_tag', '') or ''),
+        )
+
+    def build_validation_context(self) -> ValidationContext:
+        """Supply the optional lookups that enable filesystem-aware rules."""
+        icon_library: Dict[str, str] = {}
+        icon_library = dict(getattr(self, 'icon_library', None) or {})
+
+        search_dirs: List[str] = []
+        configured = getattr(self, 'icon_search_dirs', None) or []
+        search_dirs = [str(d) for d in configured if d]
+
+        return ValidationContext(
+            icon_library=icon_library,
+            icon_search_dirs=tuple(search_dirs),
+            check_icon_files=bool(icon_library or search_dirs),
+        )
+
+    def _setup_diagnostics_panel(self) -> None:
+        """Create the diagnostics dock. Hidden until the user asks for it."""
+        self.diagnostics_panel = DiagnosticsPanel(
+            self,
+            tree_provider=self.build_validation_tree,
+            context_provider=self.build_validation_context,
+        )
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.diagnostics_panel)
+        self.diagnostics_panel.hide()
+        self.diagnostics_panel.diagnostic_activated.connect(self._on_diagnostic_activated)
+
+    def _on_diagnostic_activated(self, diagnostic) -> None:
+        """Navigate to whichever focus a selected diagnostic is about.
+
+        Tree-level findings have no ``object_id``; those simply do not move
+        the view rather than clearing the user's selection out from under
+        them.
+        """
+        focus_id = getattr(diagnostic, 'object_id', None)
+        if focus_id:
+            self.navigate_to_focus(str(focus_id))
+
+    def navigate_to_focus(self, focus_id: str) -> bool:
+        """Centre the view on a focus and make it the sole selection.
+
+        Returns whether a node was found, so callers (and tests) can tell a
+        successful navigation from a diagnostic pointing at a focus that has
+        since been deleted.
+        """
+        node = (getattr(self.canvas, 'nodes', None) or {}).get(focus_id)
+        if node is None:
+            return False
+
+        self.canvas.clearSelection()
+        node.setSelected(True)
+        self.view.centerOn(node)
+        return True
+        return False
+
+    def show_diagnostics_panel(self) -> None:
+        """Reveal the panel and start a fresh validation run."""
+        panel = getattr(self, 'diagnostics_panel', None)
+        if panel is None:
+            return
+        panel.show()
+        panel.raise_()
+        panel.revalidate()
+
+    def validate_before_export(self) -> bool:
+        """Gate an export on validation. True means the export may proceed.
+
+        Errors block; warnings and info never do. Either way the findings go
+        to the panel rather than a modal list -- the user needs to click
+        through them to the offending focuses, which a modal dialog would
+        prevent. Only the yes/no question about blocking errors is asked
+        modally, because the export cannot continue until it is answered.
+        """
+        panel = getattr(self, 'diagnostics_panel', None)
+        if panel is None:
+            return True
+
+        result: ValidationResult = panel.validate_now(
+            self.build_validation_tree(), self.build_validation_context()
+        )
+
+        if not result.blocks_export:
+            return True
+
+        panel.show()
+        panel.raise_()
+
+        errors = result.errors
+        preview = "\n".join(f"  • {d.code} {d.object_id or ''}: {d.message}" for d in errors[:5])
+        if len(errors) > 5:
+            preview += f"\n  ... and {len(errors) - 5} more"
+
+        answer = QMessageBox.warning(
+            self,
+            "Validation Errors",
+            f"{len(errors)} error(s) would produce a broken focus tree:\n\n{preview}\n\n"
+            "The Diagnostics panel lists all of them; selecting one jumps to the focus.\n\n"
+            "Export anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    # -------------------------
     # Generation: UI + helpers
     # -------------------------
     def show_generate_dialog(self):
@@ -9318,6 +9789,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         max_children_spin.setToolTip("Limit children per node (0 = no extra cap beyond branching range)")
         enforce_depth_cb = QCheckBox("Enforce max depth in growth mode")
         enforce_depth_cb.setChecked(True)
+        enforce_depth_cb.setToolTip("Stop expanding branches once they reach Max depth, even in growth mode")
         # Layout randomness slider
         layout_rand_slider = QSlider(Qt.Orientation.Horizontal); layout_rand_slider.setRange(0, 100); layout_rand_slider.setValue(35)
         layout_rand_label = QLabel("35%")
@@ -9338,7 +9810,9 @@ class HOI4FocusTreeGenerator(QMainWindow):
 
         # Naming options
         use_theme_cb = QCheckBox("Use theme names (JSON)"); use_theme_cb.setChecked(True)
+        use_theme_cb.setToolTip("Pick focus names from a theme JSON file (categories -> name lists) when available")
         use_lib_cb = QCheckBox("Use library names as fallback"); use_lib_cb.setChecked(True)
+        use_lib_cb.setToolTip("Fall back to names from your project Focus Library if no theme name is available")
         # Suggest default theme if available
         default_theme_path = None
         try:
@@ -9349,7 +9823,9 @@ class HOI4FocusTreeGenerator(QMainWindow):
             default_theme_path = None
         theme_prefill = self.theme_path or (default_theme_path or "")
         theme_path_edit = QLineEdit(theme_prefill); theme_path_edit.setPlaceholderText("Select theme JSON (categories -> lists)")
+        theme_path_edit.setToolTip("Path to a JSON file mapping category names to lists of focus titles")
         browse_btn = QPushButton("Browse…")
+        browse_btn.setToolTip("Choose a theme JSON file from disk")
         def _browse():
             fn, _ = QFileDialog.getOpenFileName(self, "Select Theme JSON", "", "JSON Files (*.json)")
             if fn:
@@ -9401,22 +9877,67 @@ class HOI4FocusTreeGenerator(QMainWindow):
         # Advanced page
         adv_page = QWidget(); adv_form = QFormLayout(adv_page)
         mutex_cb = QCheckBox("Mutually exclusive root branches"); mutex_cb.setChecked(False)
+        mutex_cb.setToolTip("Make top-level root focuses mutually exclusive so players can only pick one main branch")
         # Sibling-level mutex controls
         mutex_siblings_cb = QCheckBox("Make sibling focuses mutually exclusive")
         mutex_siblings_cb.setChecked(False)
+        mutex_siblings_cb.setToolTip("Make child focuses that share the same parent mutually exclusive")
         mutex_mode_combo = QComboBox(); mutex_mode_combo.addItems(["all", "ring", "pairs"])
         mutex_mode_combo.setCurrentText("all")
+        mutex_mode_combo.setToolTip(
+            "How sibling mutually-exclusive links are wired:\n"
+            "• all: every sibling excludes every other sibling\n"
+            "• ring: each sibling excludes the next in a loop\n"
+            "• pairs: siblings are paired off two-by-two"
+        )
         mutex_prob = QDoubleSpinBox(); mutex_prob.setRange(0.0, 1.0); mutex_prob.setSingleStep(0.05); mutex_prob.setValue(1.0)
+        mutex_prob.setToolTip("Probability (0.0–1.0) that a sibling group will be made mutually exclusive")
         adv_form.addRow(mutex_siblings_cb)
         adv_form.addRow("Sibling mutex mode:", mutex_mode_combo)
         adv_form.addRow("Sibling mutex probability:", mutex_prob)
         run_in_bg_cb = QCheckBox("Run in background"); run_in_bg_cb.setChecked(True)
+        run_in_bg_cb.setToolTip("Generate the tree on a background thread so the window stays responsive")
         networks_spin = QSpinBox(); networks_spin.setRange(1, 20); networks_spin.setValue(1)
+        networks_spin.setToolTip("Generate multiple separate focus sub-trees (networks), each with its own color")
         network_size_spin = QSpinBox(); network_size_spin.setRange(1, 300); network_size_spin.setValue(100)
+        network_size_spin.setToolTip("Maximum number of focuses per network when generating multiple networks")
         adv_form.addRow(mutex_cb)
         adv_form.addRow("Number of networks:", networks_spin)
         adv_form.addRow("Network size limit:", network_size_spin)
         adv_form.addRow(run_in_bg_cb)
+        rewards_group = QGroupBox("Randomized Effects & Modifiers (Optional)")
+        rewards_form = QFormLayout(rewards_group)
+        enable_effects_cb = QCheckBox("Generate randomized base-game effects")
+        enable_effects_cb.setChecked(False)
+        enable_effects_cb.setToolTip("Fill each focus completion_reward with valid base-game HOI4 effects (PP, factories, tech, etc.)")
+        enable_modifiers_cb = QCheckBox("Generate randomized state modifiers")
+        enable_modifiers_cb.setChecked(False)
+        enable_modifiers_cb.setToolTip("Include randomized state modifiers (resources, production speed, local manpower) in rewards")
+        enable_available_cb = QCheckBox("Generate generic availability conditions")
+        enable_available_cb.setChecked(False)
+        enable_available_cb.setToolTip("Add simple availability triggers (e.g. has_war, is_subject = no, political power) to some focuses")
+        min_eff_spin = QSpinBox(); min_eff_spin.setRange(1, 5); min_eff_spin.setValue(1)
+        min_eff_spin.setToolTip("Minimum number of effects or modifiers added to each focus reward")
+        max_eff_spin = QSpinBox(); max_eff_spin.setRange(1, 6); max_eff_spin.setValue(3)
+        max_eff_spin.setToolTip("Maximum number of effects or modifiers added to each focus reward")
+        cat_pol_cb = QCheckBox("Political"); cat_pol_cb.setChecked(True)
+        cat_pol_cb.setToolTip("Include political effects (political power, stability, war support, popularity)")
+        cat_eco_cb = QCheckBox("Economy"); cat_eco_cb.setChecked(True)
+        cat_eco_cb.setToolTip("Include economy effects (civilian/military factories, infrastructure, resources)")
+        cat_mil_cb = QCheckBox("Military"); cat_mil_cb.setChecked(True)
+        cat_mil_cb.setToolTip("Include military effects (army/navy/air XP, manpower, equipment, doctrines)")
+        cat_res_cb = QCheckBox("Research"); cat_res_cb.setChecked(True)
+        cat_res_cb.setToolTip("Include research effects (tech bonuses and up to 2 research slots per tree)")
+        cat_row = QHBoxLayout()
+        for _cb in (cat_pol_cb, cat_eco_cb, cat_mil_cb, cat_res_cb):
+            cat_row.addWidget(_cb)
+        rewards_form.addRow(enable_effects_cb)
+        rewards_form.addRow(enable_modifiers_cb)
+        rewards_form.addRow(enable_available_cb)
+        rewards_form.addRow("Min effects/modifiers per focus:", min_eff_spin)
+        rewards_form.addRow("Max effects/modifiers per focus:", max_eff_spin)
+        rewards_form.addRow("Categories:", cat_row)
+        adv_form.addRow(rewards_group)
         toolbox.addItem(adv_page, "Advanced")
 
         outer_layout.addWidget(toolbox)
@@ -9477,6 +9998,15 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, "Theme", f"Failed to load theme file: {e}\nProceeding without theme.")
         params['theme'] = theme_dict
+        # effects & modifiers params
+        params['enable_effects'] = bool(enable_effects_cb.isChecked())
+        params['enable_modifiers'] = bool(enable_modifiers_cb.isChecked())
+        params['enable_available'] = bool(enable_available_cb.isChecked())
+        params['effects_per_focus'] = (int(min_eff_spin.value()), max(int(min_eff_spin.value()), int(max_eff_spin.value())))
+        params['effect_categories'] = [
+            name for name, cb in (('political', cat_pol_cb), ('economy', cat_eco_cb), ('military', cat_mil_cb), ('research', cat_res_cb))
+            if cb.isChecked()
+        ]
         # sibling mutex params
         params['mutex_siblings'] = bool(mutex_siblings_cb.isChecked())
         params['mutex_sibling_mode'] = mutex_mode_combo.currentText()
@@ -9639,7 +10169,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
         except Exception as e:
             # Do not call any GUI functions here; return an empty project and log
             logger.exception("[generator] import error in generator module")
-            return {'version': params.get('_app_version', '1.0.9'), 'tree_id': params.get('tree_id','generated'), 'country_tag': params.get('_country_tag','TAG'), 'focuses': [], 'library': params.get('_library', {})}
+            return {'version': params.get('_app_version', '1.0.12'), 'tree_id': params.get('tree_id','generated'), 'country_tag': params.get('_country_tag','TAG'), 'focuses': [], 'library': params.get('_library', {})}
         try:
             # Use captured snapshots from params to avoid accessing GUI state from background thread
             lib = params.get('_library', {})
@@ -9672,7 +10202,12 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     mutex_sibling_mode=params.get('mutex_sibling_mode', 'all'),
                     mutex_sibling_probability=float(params.get('mutex_sibling_probability', 1.0)),
                     layout_randomness=float(params.get('layout_randomness', 0.3)),
-                    theme=params.get('theme')
+                    theme=params.get('theme'),
+                    enable_effects=bool(params.get('enable_effects', False)),
+                    enable_modifiers=bool(params.get('enable_modifiers', False)),
+                    enable_available=bool(params.get('enable_available', False)),
+                    effects_per_focus=tuple(params.get('effects_per_focus', (1, 3))),
+                    effect_categories=params.get('effect_categories', None),
                 )
                 # tag network id on generated focuses; if more than network_size, mark with -1 (SuperNet)
                 for i, f in enumerate(part):
@@ -9688,7 +10223,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             logger.exception("[generator] generation exception")
             focuses = []
         project = {
-            'version': params.get('_app_version', '1.0.9'),
+            'version': params.get('_app_version', '1.0.12'),
             'tree_id': params.get('tree_id','generated'),
             'country_tag': self.country_tag,
             'focuses': [],
@@ -9917,10 +10452,15 @@ class HOI4FocusTreeGenerator(QMainWindow):
                 self.canvas.note_defaults.update(nd)
             # clear and recreate notes
             self.canvas.clear_notes()
+            notes_list = project.get('notes') or []
+            if notes_list and not bool(getattr(self.canvas, 'notes_enabled', False)):
+                self.canvas.notes_enabled = True
+                if hasattr(self, 'notes_toggle_action') and self.notes_toggle_action is not None:
+                    self.notes_toggle_action.setChecked(True)
             id_to_note: Dict[str, NoteNode] = {}
             # build lookup for focuses by id for note→focus links
             focus_id_to_node: Dict[str, FocusNode] = {}
-            for nd in (project.get('notes') or []):
+            for nd in notes_list:
                 try:
                     if isinstance(nd, dict):
                         it = NoteNode.from_dict(nd)
@@ -10736,6 +11276,11 @@ class HOI4FocusTreeGenerator(QMainWindow):
             QMessageBox.warning(self, "Warning", "No focuses to export!")
             return
 
+        # Validate before offering export options, so the user fixes problems
+        # before choosing destinations rather than after.
+        if not self.validate_before_export():
+            return
+
         # Create export dialog
         dlg = QDialog(self)
         dlg.setWindowTitle("Export Focus Tree")
@@ -11185,6 +11730,11 @@ class HOI4FocusTreeGenerator(QMainWindow):
 
     def _export_with_options(self, base_dir: str, do_focus: bool, do_goals: bool, do_shine: bool, do_events: bool, do_loc: bool, mod_structure: bool, loc_languages: Optional[List[str]] = None, do_states: bool = False) -> None:
         """Execute export based on options selected in the Export panel."""
+        # This is also reachable from the Export panel, which does not go
+        # through export_focus_tree, so the gate is applied here too.
+        if not self.validate_before_export():
+            return
+
         created: List[str] = []
 
         # Check if we have a project open - if so, create project-specific subfolder
@@ -12103,7 +12653,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
     def _build_project_payload(self) -> Dict[str, Any]:
         """Assemble the current project state into a serialisable dict."""
         project: Dict[str, Any] = {
-            'version': getattr(self, 'app_version', '1.0.9'),
+            'version': getattr(self, 'app_version', '1.0.12'),
             'tree_id': getattr(self, 'tree_id', ''),
             'country_tag': getattr(self, 'country_tag', ''),
             'focuses': [],
@@ -12218,7 +12768,8 @@ class HOI4FocusTreeGenerator(QMainWindow):
                     entry['clean_raw'] = getattr(focus, 'clean_raw', None)
                 project['focuses'].append(entry)
             except Exception as exc:
-                logger.warning('Failed to serialize focus %s: %s', getattr(focus, 'id', None), exc)
+                logger.error('Failed to serialize focus %s: %s', getattr(focus, 'id', None), exc, exc_info=True)
+                project.setdefault('_serialization_errors', []).append(str(getattr(focus, 'id', '<unknown>')))
 
         if hasattr(self, 'canvas'):
             for note in getattr(self.canvas, '_notes_items', []) or []:
@@ -12380,7 +12931,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             default_path = os.path.join(default_dir, f"{safe_tree_id}.json")
             filename, _ = QFileDialog.getSaveFileName(self, "Save Project", default_path, "JSON Files (*.json)")
 
-        # If the filename was chosen by getSaveFileName it may be relative — ensure correct default directory
+        # If the filename was chosen by getSaveFileName it may be relative - ensure correct default directory
         if filename:
             # Enforce .json extension if user omitted it or selected a non-json filter
             try:
@@ -12462,11 +13013,26 @@ class HOI4FocusTreeGenerator(QMainWindow):
                                 handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
                 except Exception as e:
                     handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
-                atomic_write_json(filename, project)
+                document = ProjectDocument.from_legacy(
+                    project, app_version=getattr(self, 'app_version', '') or '')
+                # Carry created_utc forward so it keeps meaning "first saved".
+                prior = getattr(self, '_project_metadata', None)
+                if isinstance(prior, dict) and prior.get('created_utc'):
+                    document.metadata['created_utc'] = prior['created_utc']
+                save_document(filename, document,
+                              app_version=getattr(self, 'app_version', '') or '',
+                              keep=int(getattr(self, 'backup_keep', DEFAULT_BACKUP_KEEP) or DEFAULT_BACKUP_KEEP))
+                self._project_metadata = dict(document.metadata)
                 try:
                     if not bool(getattr(self, 'muted', False)):
                         try:
-                            QMessageBox.information(self, "Success", f"Project saved to {obfuscate_path(filename)}")
+                            try:
+                                self._project_dirty = False
+                                if getattr(self, 'undo_stack', None) is not None:
+                                    self.undo_stack.setClean()
+                            except Exception:
+                                pass
+                            self.statusBar().showMessage(f"Project saved to {obfuscate_path(filename)}", 4000)
                         except Exception as e:
                             handle_exception(e, policy=PolicyConfig(policy=ErrorPolicy.LOG_ONLY, log_level="error", show_traceback=True))
                 except Exception as e:
@@ -12548,12 +13114,20 @@ class HOI4FocusTreeGenerator(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(self, "Load Project", start_dir, "JSON Files (*.json)")
         if not filename:
             return
+        # Parse, migrate and validate the whole document before touching any
+        # editor state -- nothing below runs unless the file is fully sound.
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                project = json.load(f)
+            document = load_document(filename)
+        except ProjectDocumentError as doc_exc:
+            recovered = self._offer_project_recovery(filename, doc_exc)
+            if recovered is None:
+                return
+            document, filename = recovered
         except Exception as e:
             show_error(self, "Error", "Failed to read project file.", exc=e)
             return
+        project = document.to_legacy()
+        self._project_metadata = dict(document.metadata)
 
         # Apply metadata early
         try:
@@ -13080,7 +13654,7 @@ class HOI4FocusTreeGenerator(QMainWindow):
             export_data = {
                 "library": self.library,
                 "folders": self.library_folders,
-                "version": "1.0.9",
+                "version": "1.0.12",
                 "exported_date": time.time()
             }
             with open(filename, 'w', encoding='utf-8') as f:
@@ -13493,6 +14067,20 @@ def _setup_diagnostic_logging() -> Optional[str]:
 
         def _log_uncaught(exc_type, exc_val, exc_tb):
             logging.getLogger(__name__).critical('Uncaught exception', exc_info=(exc_type, exc_val, exc_tb))
+            try:
+                ref = globals().get('_ACTIVE_EDITOR_REF')
+                ed = ref() if callable(ref) else None
+                if ed is not None and not getattr(ed, '_crash_save_in_progress', False):
+                    ed._crash_save_in_progress = True
+                    base = ed._resolve_autosave_base_path()
+                    if base:
+                        crash_path = f"{base}.crash_recovery.json"
+                        payload = ed._build_project_payload()
+                        doc = ProjectDocument.from_legacy(payload)
+                        save_document(crash_path, doc, backup_count=0)
+                        logging.getLogger(__name__).info('Wrote emergency crash recovery snapshot to %s', crash_path)
+            except Exception:
+                pass
 
         sys.excepthook = _log_uncaught
         return str(log_file)
@@ -13500,12 +14088,35 @@ def _setup_diagnostic_logging() -> Optional[str]:
         return None
 
 
+def _apply_dark_fusion_palette(app: QApplication) -> None:
+    """Apply a consistent dark Fusion palette across Windows, Wine, and Linux."""
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(37, 39, 43))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(232, 234, 237))
+    pal.setColor(QPalette.ColorRole.Base, QColor(25, 27, 30))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(44, 47, 52))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(37, 39, 43))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(232, 234, 237))
+    pal.setColor(QPalette.ColorRole.Text, QColor(232, 234, 237))
+    pal.setColor(QPalette.ColorRole.Button, QColor(44, 47, 52))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(232, 234, 237))
+    pal.setColor(QPalette.ColorRole.BrightText, QColor(255, 255, 255))
+    pal.setColor(QPalette.ColorRole.Link, QColor(88, 166, 255))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(125, 130, 136))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(125, 130, 136))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(125, 130, 136))
+    app.setPalette(pal)
+
+
 def main():
     _setup_diagnostic_logging()
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    _apply_dark_fusion_palette(app)
     app.setApplicationName("HOI4 Focus GUI")
-    app.setApplicationVersion("1.0.9")
+    app.setApplicationVersion("1.0.12")
     app.setOrganizationName("HOI4 Modding Community")
     handler = configure_error_handler(gui_parent=None, log_level="INFO")
     window = HOI4FocusTreeGenerator()

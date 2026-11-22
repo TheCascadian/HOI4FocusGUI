@@ -1,0 +1,9 @@
+focus_tree = {
+	id = unterminated_tree
+	focus = {
+		id = unterminated_focus
+		text = "this string never closes
+		x = 0
+		y = 0
+	}
+}
